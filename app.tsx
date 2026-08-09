@@ -3,17 +3,20 @@ import { useEffect, useState } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 
+type Sample = {
+  ts: number; cpuPct: number; load1: number; load5: number; cpuCount: number;
+  memTotalMb: number; memUsedMb: number; memUsedFrac: number; pressureLevel: number;
+  swapUsedMb: number; diskTotalGb: number; diskUsedGb: number;
+};
 type Current = {
-  sample: {
-    ts: number; load1: number; load5: number; cpuCount: number;
-    memTotalMb: number; memUsedMb: number; memPressure: number;
-    swapUsedMb: number; diskTotalGb: number; diskUsedGb: number;
-  } | null;
+  sample: Sample | null;
   topCpu: { pid: number; cpu: number; memMb: number; command: string }[];
   topMem: { pid: number; cpu: number; memMb: number; command: string }[];
   uptime: string;
 };
-type Hist = { samples: NonNullable<Current["sample"]>[] };
+type Hist = { samples: Sample[] };
+
+const PRESSURE: Record<number, string> = { 1: "normal", 2: "warning", 4: "critical" };
 
 function Meter({ frac, tone }: { frac: number; tone: "ok" | "warn" | "hot" }) {
   const cls = tone === "hot" ? "bg-destructive" : tone === "warn" ? "bg-primary/70" : "bg-primary";
@@ -24,8 +27,8 @@ function Meter({ frac, tone }: { frac: number; tone: "ok" | "warn" | "hot" }) {
   );
 }
 
-function Tile(props: { label: string; value: string; sub: string; frac: number }) {
-  const tone = props.frac >= 0.9 ? "hot" : props.frac >= 0.75 ? "warn" : "ok";
+function Tile(props: { label: string; value: string; sub: string; frac: number; hot?: boolean }) {
+  const tone = props.hot || props.frac >= 0.9 ? "hot" : props.frac >= 0.75 ? "warn" : "ok";
   return (
     <div className="rounded-lg border border-border bg-card p-4 space-y-2">
       <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">{props.label}</div>
@@ -36,11 +39,12 @@ function Tile(props: { label: string; value: string; sub: string; frac: number }
   );
 }
 
-function Spark({ points, title }: { points: number[]; title: string }) {
+function Spark({ points, title, max }: { points: number[]; title: string; max: number }) {
   if (points.length < 2) return null;
-  const w = 280, h = 48, max = Math.max(...points, 0.01);
+  const w = 280, h = 48;
+  const top = Math.max(max, ...points, 0.01);
   const path = points
-    .map((v, i) => `${((i / (points.length - 1)) * w).toFixed(1)},${(h - (v / max) * (h - 4) - 2).toFixed(1)}`)
+    .map((v, i) => `${((i / (points.length - 1)) * w).toFixed(1)},${(h - (v / top) * (h - 4) - 2).toFixed(1)}`)
     .join(" ");
   return (
     <div className="rounded-lg border border-border bg-card p-3">
@@ -72,7 +76,7 @@ function ProcTable({ title, rows, metric }: { title: string; rows: Current["topC
   );
 }
 
-function useSystem(minutes: number) {
+function useSystem(minutes: number, announceWatching: boolean) {
   const rpc = useRpc<typeof rpcContract>();
   const [cur, setCur] = useState<Current | null>(null);
   const [hist, setHist] = useState<Hist | null>(null);
@@ -82,6 +86,11 @@ function useSystem(minutes: number) {
   };
   useEffect(() => {
     void load();
+    if (!announceWatching) return;
+    // Tell the sampler someone is looking, so it samples at the fast cadence.
+    void rpc.call("watching", null);
+    const t = setInterval(() => void rpc.call("watching", null), 60_000);
+    return () => clearInterval(t);
   }, []);
   useRealtime("system.sample", () => {
     void load();
@@ -90,21 +99,28 @@ function useSystem(minutes: number) {
 }
 
 function SystemPanel() {
-  const { cur, hist } = useSystem(60);
+  const { cur, hist } = useSystem(60, true);
   const s = cur?.sample;
-  if (!s) return <div className="p-5 text-muted-foreground text-sm">Sampling… first data arrives within 15s.</div>;
+  if (!s) return <div className="p-5 text-muted-foreground text-sm">Sampling… first data arrives shortly.</div>;
   const samples = hist?.samples ?? [];
+  const pressure = PRESSURE[s.pressureLevel] ?? String(s.pressureLevel);
   return (
     <div className="p-4 md:p-5 overflow-y-auto h-full">
       <div className="mx-auto w-full max-w-3xl space-y-4">
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <Tile label="CPU" value={s.load1.toFixed(2)} sub={`load / ${s.cpuCount} cores · 5m ${s.load5.toFixed(2)}`} frac={s.load1 / s.cpuCount} />
-          <Tile label="Memory" value={`${(s.memUsedMb / 1024).toFixed(1)} GB`} sub={`of ${(s.memTotalMb / 1024).toFixed(0)} GB${s.swapUsedMb > 0 ? ` · swap ${(s.swapUsedMb / 1024).toFixed(1)} GB` : ""}`} frac={s.memPressure} />
-          <Tile label="Disk" value={`${s.diskUsedGb} GB`} sub={`of ${s.diskTotalGb} GB (data volume)`} frac={s.diskUsedGb / s.diskTotalGb} />
+          <Tile label="CPU" value={`${Math.round(s.cpuPct)}%`} sub={`${s.cpuCount} cores · load ${s.load1.toFixed(2)}`} frac={s.cpuPct / 100} />
+          <Tile
+            label="Memory used"
+            value={`${(s.memUsedMb / 1024).toFixed(1)} GB`}
+            sub={`of ${(s.memTotalMb / 1024).toFixed(0)} GB · pressure ${pressure}${s.swapUsedMb > 0 ? ` · swap ${(s.swapUsedMb / 1024).toFixed(1)} GB` : ""}`}
+            frac={s.memUsedFrac}
+            hot={s.pressureLevel >= 2}
+          />
+          <Tile label="Disk" value={`${s.diskUsedGb} GB`} sub={`of ${s.diskTotalGb} GB (data volume)`} frac={s.diskUsedGb / (s.diskTotalGb || 1)} />
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <Spark title="CPU load — last hour" points={samples.map((x) => x.load1)} />
-          <Spark title="Memory pressure — last hour" points={samples.map((x) => x.memPressure)} />
+          <Spark title="CPU % — last hour" points={samples.map((x) => x.cpuPct)} max={100} />
+          <Spark title="Memory used — last hour" points={samples.map((x) => x.memUsedFrac)} max={1} />
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <ProcTable title="Top CPU" rows={cur!.topCpu} metric="cpu" />
@@ -117,14 +133,20 @@ function SystemPanel() {
 }
 
 function HomeTiles() {
-  const { cur } = useSystem(5);
+  const { cur } = useSystem(5, false);
   const s = cur?.sample;
   if (!s) return null;
   return (
     <div className="grid grid-cols-3 gap-3">
-      <Tile label="CPU" value={s.load1.toFixed(2)} sub={`${s.cpuCount} cores`} frac={s.load1 / s.cpuCount} />
-      <Tile label="Memory" value={`${Math.round(s.memPressure * 100)}%`} sub={`${(s.memUsedMb / 1024).toFixed(1)} GB used`} frac={s.memPressure} />
-      <Tile label="Disk" value={`${Math.round((s.diskUsedGb / s.diskTotalGb) * 100)}%`} sub={`${s.diskTotalGb - s.diskUsedGb} GB free`} frac={s.diskUsedGb / s.diskTotalGb} />
+      <Tile label="CPU" value={`${Math.round(s.cpuPct)}%`} sub={`${s.cpuCount} cores`} frac={s.cpuPct / 100} />
+      <Tile
+        label="Memory"
+        value={`${Math.round(s.memUsedFrac * 100)}%`}
+        sub={`${(s.memUsedMb / 1024).toFixed(1)} GB used`}
+        frac={s.memUsedFrac}
+        hot={s.pressureLevel >= 2}
+      />
+      <Tile label="Disk" value={`${Math.round((s.diskUsedGb / (s.diskTotalGb || 1)) * 100)}%`} sub={`${s.diskTotalGb - s.diskUsedGb} GB free`} frac={s.diskUsedGb / (s.diskTotalGb || 1)} />
     </div>
   );
 }
