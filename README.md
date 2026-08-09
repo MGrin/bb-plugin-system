@@ -1,83 +1,45 @@
 # bb-plugin-system
 
-A BB plugin.
+A live system overview inside [bb](https://getbb.app) — see what the machine is doing
+while your agents work it.
 
-## UI components
-
-`components/ui/` is vendored source you own (the shadcn model): edit the
-files freely — they never update out from under you. Add more from the BB
-component registry (the full shadcn set, version-matched to your BB install
-via the pinned ref in `components.json`):
-
-```
-npx shadcn add @bb/dialog @bb/select
+```sh
+bb plugin install git:https://github.com/MGrin/bb-plugin-system.git@main
 ```
 
-Run `npm install` once before `bb plugin build` — the vendored components'
-npm deps bundle into your dist. React, and BB-shimmed packages like the
-radix portal primitives and `sonner` (`import { toast } from "sonner"`
-reaches BB's own toaster), are provided by the BB app at runtime and never
-bundled. Ship `dist/` (npm tarball or committed for git installs) so
-people installing your plugin never need npm.
+## What it gives you
 
-## Manifest
+**System panel** — CPU, memory and disk tiles with status-toned meters, sparklines for
+the last hour, and top-process tables by CPU and by memory.
 
-`package.json` is the plugin manifest. Notable fields:
+**Homepage tiles** — a compact CPU / memory / disk row.
 
-- `bb.server` — backend entry (required); optional `bb.app` for a frontend.
-- `bb.name` and `bb.description` — required human-facing identity.
-- `bb.branding` — required; declare `icon` as a BB icon name or a
-  plugin-relative compact SVG, or declare `logo.light` (with optional
-  `logo.dark`). Logo assets must be relative `.svg`, `.png`, or
-  `.webp` files.
-- `engines.bb` — supported bb app version range.
-- `engines.bbPluginSdk` — supported plugin SDK range (scaffold: `^0.4.1`).
-
-Run `bb plugin build` before publishing git/npm installs. It writes
-`dist/server.js` + `server.meta.json` (and, with `bb.app`, `app.js` /
-`app.css` / `app.meta.json`). Each `*.meta.json` stamps SDK major/version,
-`artifactFormatVersion`, `pluginId`, `pluginVersion`, and
-`builtWith` so managed installs can verify the artifacts.
-
-## Install
-
-From this directory:
+**`bb system`** — the same data for agents, as text:
 
 ```
-bb plugin install .
+bb system [overview]   current snapshot with ASCII meters
+bb system top          top processes by CPU and memory
+bb system history [m]  compact trend for the last N minutes (default 60)
 ```
 
-After editing sources, reload:
+Unlike a menu-bar monitor, this keeps **history**: a background sampler writes to a 24-hour
+ring buffer, so you can answer "what was this machine doing twenty minutes ago, while that
+fleet was running?" — which is the question that actually comes up.
 
-```
-bb plugin reload system
-```
+## Status
 
-## Configure
+macOS only today (it reads `sysctl`, `vm_stat`, `df` and `ps`). Known work in progress:
 
-```
-bb plugin config system
-bb plugin config system set greeting hi
-```
+- Migrating metric collection to [`systeminformation`](https://www.npmjs.com/package/systeminformation)
+  for correctness and cross-platform support. The current memory figure is computed from
+  the VM active queue, which understates real usage, and the CPU meter is derived from
+  load average rather than true utilization.
+- Making the sample interval adaptive (frequent while threads are running or the panel is
+  open, sparse otherwise) instead of a fixed 15 seconds.
 
-## Types & API reference
+See also [get-bb/bb#1171](https://github.com/get-bb/bb/pull/1171), an open proposal for an
+official System Monitor plugin.
 
-`types/bb-plugin-sdk.d.ts` (and `types/bb-plugin-sdk-app.d.ts` for the
-frontend) are the full, bundled BB plugin API — `tsconfig.json` maps
-`@bb/plugin-sdk` to them, so your editor and `tsc` see real types with no extra
-install. They are readable declarations: open them for an exact signature.
+## License
 
-The SDK surface grows with every BB release, and these are a copy. Refresh
-them from the BB you are running:
-
-```
-bb plugin types          # rewrite types/ from this BB
-bb plugin types --check  # CI: fail when they are out of date
-```
-
-`bb plugin build` and `bb plugin dev` refresh them for you. Ask BB to write
-plugins for you: the `bb-plugin-authoring` skill documents the whole surface
-with examples.
-
-Confused by the API, or need something the types don't explain? Clone the BB
-repo and read the source: <https://github.com/get-bb/bb>.
+MIT

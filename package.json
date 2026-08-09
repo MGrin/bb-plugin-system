@@ -33,5 +33,10 @@
     "zod": "^4.3.6",
     "@radix-ui/react-dialog": "^1.1.19",
     "vaul": "^1.1.2"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MGrin/bb-plugin-system.git"
   }
 }
