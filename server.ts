@@ -29,8 +29,8 @@ const ACTIVE_MS = 15_000; // a thread is running a turn, or the panel is open
 const IDLE_MS = 60_000; // nobody is watching and nothing is working
 const RETAIN_MS = 24 * 60 * 60 * 1000;
 const PRIMARY_FALLBACK_ID = "__primary__";
-// Covers terminal creation, the sampler script (~5 s on macOS, most of it the
-// two top samples), and the 3 s drain window after the script finishes.
+// End-to-end budget: terminal creation, the sampler script (~5 s on macOS,
+// most of it the two top samples), and draining the transcript.
 const REMOTE_COMMAND_TIMEOUT_MS = 20_000;
 
 const sampleShape = z.object({
@@ -370,15 +370,17 @@ export default async function plugin(bb: BbPluginApi) {
     // drops bytes, so the shell never sees the full script. Each sample gets a
     // fresh terminal, so failed hosts cannot churn a long-lived remote shell.
     // base64 -D (macOS) vs -d (GNU) is handled by trying both. The trailing
-    // sleep keeps the session running long enough to drain its output; the
-    // drain loop also tolerates the 409 an exited session returns, so nothing
-    // depends on the sleep alone.
+    // `cat` holds the session open (its stdin is the PTY, which never receives
+    // input) until the drain loop has captured the full transcript, so output
+    // cannot become unavailable mid-read; the finally block reaps the
+    // terminal — and with it any hung command — afterwards.
     const payload = Buffer.from(REMOTE_SAMPLE_SCRIPT, "utf8").toString("base64");
     const command = [
       "printf %s", shellQuote(payload),
       "| { base64 -D 2>/dev/null || base64 -d; }",
-      "| /bin/sh; sleep 3",
+      "| /bin/sh; cat >/dev/null",
     ].join(" ");
+    const deadline = Date.now() + REMOTE_COMMAND_TIMEOUT_MS;
     const terminal = await bb.sdk.terminals.create({
       cols: 200,
       rows: 50,
@@ -386,29 +388,30 @@ export default async function plugin(bb: BbPluginApi) {
       start: { mode: "command", command: "/bin/sh -c " + shellQuote(command) },
       title: "System metrics",
     });
-    const deadline = Date.now() + REMOTE_COMMAND_TIMEOUT_MS;
     let text = "";
     let nextSeq = 0;
     try {
+      let state = terminal;
+      while (state.status === "starting") {
+        if (signal?.aborted) throw new Error("sampling cancelled");
+        if (Date.now() >= deadline) throw new Error("metric terminal timed out");
+        await abortableDelay(150, signal);
+        state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
+      }
+      // The blocking cat keeps the session running until we close it, so a
+      // session that is no longer running never has a complete transcript.
+      if (state.status !== "running") throw new Error("metric terminal did not stay running");
       while (!text.includes("__BB_SYSTEM_END__")) {
         if (signal?.aborted) throw new Error("sampling cancelled");
         if (Date.now() >= deadline) throw new Error("metric command timed out");
-        try {
-          const output = await bb.sdk.terminals.output({
-            terminalId: terminal.id,
-            sinceSeq: nextSeq,
-            limitChunks: 500,
-            signal,
-          });
-          text += decodeTerminalOutput(output.chunks);
-          nextSeq = output.nextSeq;
-        } catch (error) {
-          // The session exits once `sleep 3` ends, after which output is
-          // unavailable (HTTP 409). If the transcript is already complete,
-          // finish from what we have; otherwise surface the error.
-          if (text.includes("__BB_SYSTEM_END__")) break;
-          throw error;
-        }
+        const output = await bb.sdk.terminals.output({
+          terminalId: terminal.id,
+          sinceSeq: nextSeq,
+          limitChunks: 500,
+          signal,
+        });
+        text += decodeTerminalOutput(output.chunks);
+        nextSeq = output.nextSeq;
         if (!text.includes("__BB_SYSTEM_END__")) await abortableDelay(150, signal);
       }
       const match = text.match(/__BB_SYSTEM_BEGIN__\r?\n([\s\S]*?)__BB_SYSTEM_END__/);
@@ -445,12 +448,12 @@ export default async function plugin(bb: BbPluginApi) {
       };
       return { sample, topCpu, topMem, uptime: values.get("uptime") ?? "" };
     } finally {
-      // Reap the one-shot terminal either way: success or failure. On success
-      // the session has already exited (or is in its drain sleep); on timeout
-      // this is what kills the hung command.
-      if (!signal?.aborted) {
-        void bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => undefined);
-      }
+      // Always reap the one-shot terminal — success, failure, or abort. On
+      // success the blocking cat is still holding the session open; on
+      // timeout or shutdown this is what kills the hung command. The abort
+      // guard is deliberately absent: a service reload is exactly when a
+      // stranded remote shell must not be left behind.
+      void bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => undefined);
     }
   }
 
