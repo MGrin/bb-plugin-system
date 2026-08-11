@@ -10,7 +10,8 @@ bb plugin install git:https://github.com/MGrin/bb-plugin-system.git@main
 ## What it gives you
 
 **System panel** — CPU, memory and disk tiles with status-toned meters, sparklines for
-the last hour, and top-process tables by CPU and by memory.
+the last hour, and top-process tables by CPU and by memory. A machine picker switches
+the whole dashboard between the primary bb machine and any connected enrolled machine.
 
 **Homepage tiles** — a compact CPU / memory / disk row.
 
@@ -22,14 +23,17 @@ bb system top          top processes by CPU and memory
 bb system history [m]  compact trend for the last N minutes (default 60)
 ```
 
-Unlike a menu-bar monitor, this keeps **history**: a background sampler writes to a 24-hour
-ring buffer, so you can answer "what was this machine doing twenty minutes ago, while that
-fleet was running?" — which is the question that actually comes up.
+Unlike a menu-bar monitor, this keeps **per-machine history**: a background sampler writes
+to a 24-hour ring buffer, so you can answer "what was this machine doing twenty minutes ago,
+while that fleet was running?" — which is the question that actually comes up.
 
 ## How it measures
 
-Metrics come from [`systeminformation`](https://www.npmjs.com/package/systeminformation)
-(MIT, zero dependencies), which matters more than it sounds:
+Metrics on the primary machine come from
+[`systeminformation`](https://www.npmjs.com/package/systeminformation) (MIT, zero
+dependencies). Connected machines are sampled through their bb daemon with native macOS
+or Linux tools, so the plugin server never mistakes its own filesystem and processes for
+the selected machine's.
 
 - **Memory** uses Activity Monitor's basis (`anonymous - purgeable + wired + compressed`).
   Summing `Pages active + wired + compressor` — the obvious `vm_stat` reading — counts
@@ -48,8 +52,8 @@ the plugin uses that.
 Top-process tables still shell `ps` directly: systeminformation's darwin implementation
 runs the same command with more columns and takes its decayed `pcpu` verbatim.
 
-macOS is the tested platform; the metric library covers Linux and Windows, but the
-pressure reading and process table are macOS-specific.
+macOS is the tested platform. Remote sampling also supports Linux; Windows machines remain
+listed but cannot currently be sampled.
 
 See also [get-bb/bb#1171](https://github.com/get-bb/bb/pull/1171), an open proposal for an
 official System Monitor plugin.
