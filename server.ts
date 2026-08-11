@@ -364,6 +364,18 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
+  // Combine the caller's abort signal with a deadline so every terminal call
+  // is itself time-bounded; without AbortSignal.timeout/any (older runtimes)
+  // this degrades to the caller's signal alone, still bounded by bb's own
+  // terminal-operation timeouts.
+  function signalWithTimeout(signal: AbortSignal | undefined, remainingMs: number): AbortSignal {
+    if (typeof AbortSignal.timeout !== "function") return signal ?? new AbortController().signal;
+    const timeout = AbortSignal.timeout(Math.max(1, remainingMs));
+    return signal && typeof AbortSignal.any === "function"
+      ? AbortSignal.any([signal, timeout])
+      : signal ?? timeout;
+  }
+
   async function takeRemoteSample(hostId: string, signal?: AbortSignal): Promise<CurrentData> {
     // Run the sampler as a one-shot command instead of pasting it into a
     // reused interactive shell: on macOS a multi-line terminals.input write
@@ -396,7 +408,18 @@ export default async function plugin(bb: BbPluginApi) {
         if (signal?.aborted) throw new Error("sampling cancelled");
         if (Date.now() >= deadline) throw new Error("metric terminal timed out");
         await abortableDelay(150, signal);
-        state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
+        state = await (async () => {
+          try {
+            return await bb.sdk.terminals.get({
+              terminalId: terminal.id,
+              signal: signalWithTimeout(signal, deadline - Date.now()),
+            });
+          } catch (error) {
+            if (signal?.aborted) throw new Error("sampling cancelled");
+            if (Date.now() >= deadline) throw new Error("metric terminal timed out");
+            throw error;
+          }
+        })();
       }
       // The blocking cat keeps the session running until we close it, so a
       // session that is no longer running never has a complete transcript.
@@ -404,12 +427,20 @@ export default async function plugin(bb: BbPluginApi) {
       while (!text.includes("__BB_SYSTEM_END__")) {
         if (signal?.aborted) throw new Error("sampling cancelled");
         if (Date.now() >= deadline) throw new Error("metric command timed out");
-        const output = await bb.sdk.terminals.output({
-          terminalId: terminal.id,
-          sinceSeq: nextSeq,
-          limitChunks: 500,
-          signal,
-        });
+        const output = await (async () => {
+          try {
+            return await bb.sdk.terminals.output({
+              terminalId: terminal.id,
+              sinceSeq: nextSeq,
+              limitChunks: 500,
+              signal: signalWithTimeout(signal, deadline - Date.now()),
+            });
+          } catch (error) {
+            if (signal?.aborted) throw new Error("sampling cancelled");
+            if (Date.now() >= deadline) throw new Error("metric command timed out");
+            throw error;
+          }
+        })();
         text += decodeTerminalOutput(output.chunks);
         nextSeq = output.nextSeq;
         if (!text.includes("__BB_SYSTEM_END__")) await abortableDelay(150, signal);
