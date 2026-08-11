@@ -213,7 +213,11 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
       if (timer) clearInterval(timer);
     };
   }, [announceWatching, hostId, load, rpc]);
-  useRealtime("system.sample", () => {
+  useRealtime("system.sample", (event) => {
+    // The sampler publishes for every connected host; only the machine on
+    // screen needs a reload.
+    const payload = event as { hostId?: string } | null;
+    if (payload?.hostId && payload.hostId !== hostId) return;
     void load();
   });
   return { cur, hist, error };

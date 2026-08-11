@@ -29,7 +29,9 @@ const ACTIVE_MS = 15_000; // a thread is running a turn, or the panel is open
 const IDLE_MS = 60_000; // nobody is watching and nothing is working
 const RETAIN_MS = 24 * 60 * 60 * 1000;
 const PRIMARY_FALLBACK_ID = "__primary__";
-const REMOTE_COMMAND_TIMEOUT_MS = 12_000;
+// Covers terminal creation, the sampler script (~5 s on macOS, most of it the
+// two top samples), and the 3 s drain window after the script finishes.
+const REMOTE_COMMAND_TIMEOUT_MS = 20_000;
 
 const sampleShape = z.object({
   ts: z.number(),
@@ -130,7 +132,7 @@ if [ "$platform" = "Darwin" ]; then
   mem_total_kb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 ))
   mem_used_kb=$(vm_stat 2>/dev/null | awk '
     NR==1 { gsub(/[^0-9]/, "", $0); page=$0+0; next }
-    /Pages anonymous:/ { anon=$3 }
+    /Anonymous pages:/ { anon=$3 }
     /Pages active:/ { active=$3 }
     /Pages inactive:/ { inactive=$3 }
     /Pages purgeable:/ { purgeable=$3 }
@@ -141,7 +143,8 @@ if [ "$platform" = "Darwin" ]; then
       gsub(/\./, "", purgeable); gsub(/\./, "", wired); gsub(/\./, "", compressed);
       if (!anon) anon=active+inactive;
       used=(anon-purgeable+wired+compressed)*page/1024;
-      printf "%.0f", used > 0 ? used : 0
+      if (used < 0) used = 0;
+      printf "%.0f", used
     }')
   pressure=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1)
   swap_used_kb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{ for (i=1;i<=NF;i++) if ($i=="used") { v=$(i+2); sub(/M$/, "", v); printf "%.0f", v*1024 } }')
@@ -337,7 +340,6 @@ export default async function plugin(bb: BbPluginApi) {
   const remoteCurrent = new Map<string, Omit<CurrentData, "sample">>();
   const sampling = new Map<string, Promise<CurrentData>>();
   const lastAttemptAt = new Map<string, number>();
-  const remoteTerminals = new Map<string, { id: string; nextSeq: number }>();
   const backgroundSamples = new Set<Promise<void>>();
 
   const parseProcess = (value: string) => {
@@ -349,46 +351,6 @@ export default async function plugin(bb: BbPluginApi) {
       command: command.join("|").split("/").pop()!.slice(0, 48),
     };
   };
-
-  async function remoteTerminal(hostId: string, signal?: AbortSignal) {
-    if (signal?.aborted) throw new Error("sampling cancelled");
-    const existing = remoteTerminals.get(hostId);
-    if (existing) {
-      try {
-        const terminal = await bb.sdk.terminals.get({ terminalId: existing.id, signal });
-        if (terminal.status === "running") return existing;
-      } catch (error) {
-        if (signal?.aborted) throw error;
-      }
-      remoteTerminals.delete(hostId);
-    }
-    const terminal = await bb.sdk.terminals.create({
-      cols: 120,
-      rows: 40,
-      scope: { kind: "host_path", hostId, cwd: null },
-      // Pin a POSIX shell: the user's interactive shell may be fish or another
-      // syntax-incompatible shell, while the sampler command is portable sh.
-      start: { mode: "command", command: "/bin/sh" },
-      title: "System metrics",
-    });
-    const deadline = Date.now() + REMOTE_COMMAND_TIMEOUT_MS;
-    let state = terminal;
-    try {
-      while (state.status === "starting") {
-        if (signal?.aborted) throw new Error("sampling cancelled");
-        if (Date.now() >= deadline) throw new Error("metric terminal timed out");
-        await abortableDelay(150, signal);
-        state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
-      }
-      if (state.status !== "running") throw new Error("metric terminal did not start");
-    } catch (error) {
-      void bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => undefined);
-      throw error;
-    }
-    const session = { id: terminal.id, nextSeq: 0 };
-    remoteTerminals.set(hostId, session);
-    return session;
-  }
 
   function abortableDelay(ms: number, signal?: AbortSignal) {
     return new Promise<void>((resolve) => {
@@ -403,36 +365,50 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function takeRemoteSample(hostId: string, signal?: AbortSignal): Promise<CurrentData> {
-    const terminal = await remoteTerminal(hostId, signal);
+    // Run the sampler as a one-shot command instead of pasting it into a
+    // reused interactive shell: on macOS a multi-line terminals.input write
+    // drops bytes, so the shell never sees the full script. Each sample gets a
+    // fresh terminal, so failed hosts cannot churn a long-lived remote shell.
+    // base64 -D (macOS) vs -d (GNU) is handled by trying both. The trailing
+    // sleep keeps the session running long enough to drain its output; the
+    // drain loop also tolerates the 409 an exited session returns, so nothing
+    // depends on the sleep alone.
     const payload = Buffer.from(REMOTE_SAMPLE_SCRIPT, "utf8").toString("base64");
-    // PTYs commonly cap one canonical input line at 4096 bytes. Build the
-    // encoded payload across short assignments before decoding it, otherwise
-    // the full sampler script is silently truncated on some hosts.
-    const payloadChunks = payload.match(/.{1,1800}/g) ?? [];
     const command = [
-      "payload=''",
-      ...payloadChunks.map((chunk) => 'payload="${payload}' + chunk + '"'),
-      `if [ "$(uname -s)" = Darwin ]; then printf '%s' "$payload" | base64 -D; else printf '%s' "$payload" | base64 -d; fi | /bin/sh`,
-      "",
-    ].join("\n");
-    await bb.sdk.terminals.input({
-      terminalId: terminal.id,
-      dataBase64: Buffer.from(command, "utf8").toString("base64"),
+      "printf %s", shellQuote(payload),
+      "| { base64 -D 2>/dev/null || base64 -d; }",
+      "| /bin/sh; sleep 3",
+    ].join(" ");
+    const terminal = await bb.sdk.terminals.create({
+      cols: 200,
+      rows: 50,
+      scope: { kind: "host_path", hostId, cwd: null },
+      start: { mode: "command", command: "/bin/sh -c " + shellQuote(command) },
+      title: "System metrics",
     });
     const deadline = Date.now() + REMOTE_COMMAND_TIMEOUT_MS;
     let text = "";
+    let nextSeq = 0;
     try {
       while (!text.includes("__BB_SYSTEM_END__")) {
         if (signal?.aborted) throw new Error("sampling cancelled");
         if (Date.now() >= deadline) throw new Error("metric command timed out");
-        const output = await bb.sdk.terminals.output({
-          terminalId: terminal.id,
-          sinceSeq: terminal.nextSeq,
-          limitChunks: 500,
-          signal,
-        });
-        text += decodeTerminalOutput(output.chunks);
-        terminal.nextSeq = output.nextSeq;
+        try {
+          const output = await bb.sdk.terminals.output({
+            terminalId: terminal.id,
+            sinceSeq: nextSeq,
+            limitChunks: 500,
+            signal,
+          });
+          text += decodeTerminalOutput(output.chunks);
+          nextSeq = output.nextSeq;
+        } catch (error) {
+          // The session exits once `sleep 3` ends, after which output is
+          // unavailable (HTTP 409). If the transcript is already complete,
+          // finish from what we have; otherwise surface the error.
+          if (text.includes("__BB_SYSTEM_END__")) break;
+          throw error;
+        }
         if (!text.includes("__BB_SYSTEM_END__")) await abortableDelay(150, signal);
       }
       const match = text.match(/__BB_SYSTEM_BEGIN__\r?\n([\s\S]*?)__BB_SYSTEM_END__/);
@@ -468,12 +444,13 @@ export default async function plugin(bb: BbPluginApi) {
         diskUsedGb: Math.round(num("disk_used_kb") / 1048576),
       };
       return { sample, topCpu, topMem, uptime: values.get("uptime") ?? "" };
-    } catch (error) {
+    } finally {
+      // Reap the one-shot terminal either way: success or failure. On success
+      // the session has already exited (or is in its drain sleep); on timeout
+      // this is what kills the hung command.
       if (!signal?.aborted) {
-        remoteTerminals.delete(hostId);
         void bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => undefined);
       }
-      throw error;
     }
   }
 
@@ -482,12 +459,6 @@ export default async function plugin(bb: BbPluginApi) {
       Promise.allSettled([...backgroundSamples]),
       new Promise((resolve) => setTimeout(resolve, 2_500)),
     ]);
-    const terminals = [...remoteTerminals.values()];
-    remoteTerminals.clear();
-    const closing = Promise.all(terminals.map((terminal) =>
-      bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => undefined),
-    ));
-    await Promise.race([closing, new Promise((resolve) => setTimeout(resolve, 1_000))]);
   });
 
   async function sampleHost(hostId: string, signal?: AbortSignal): Promise<CurrentData> {
