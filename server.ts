@@ -407,7 +407,7 @@ export default async function plugin(bb: BbPluginApi) {
       while (state.status === "starting") {
         if (signal?.aborted) throw new Error("sampling cancelled");
         if (Date.now() >= deadline) throw new Error("metric terminal timed out");
-        await abortableDelay(150, signal);
+        await abortableDelay(Math.min(150, deadline - Date.now()), signal);
         state = await (async () => {
           try {
             return await bb.sdk.terminals.get({
@@ -443,7 +443,7 @@ export default async function plugin(bb: BbPluginApi) {
         })();
         text += decodeTerminalOutput(output.chunks);
         nextSeq = output.nextSeq;
-        if (!text.includes("__BB_SYSTEM_END__")) await abortableDelay(150, signal);
+        if (!text.includes("__BB_SYSTEM_END__")) await abortableDelay(Math.min(150, deadline - Date.now()), signal);
       }
       const match = text.match(/__BB_SYSTEM_BEGIN__\r?\n([\s\S]*?)__BB_SYSTEM_END__/);
       if (!match) throw new Error("metric command returned no data");
