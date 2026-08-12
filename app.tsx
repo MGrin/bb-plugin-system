@@ -39,78 +39,21 @@ type Machine = {
 
 const PRESSURE: Record<number, string> = { 1: "normal", 2: "warning", 4: "critical" };
 const SELECTED_MACHINE_KEY = "bb-plugin-system:selected-machine";
-const PRIMARY_COMPOSER_SELECTOR = '[data-app-composer-role="primary"]';
 
-// Compatibility boundary: homepageSection currently exposes the project but
-// not the new-thread composer's selected host. Keep the host-DOM fallback in
-// these helpers so it is easy to remove when the SDK grows that field.
-function selectedComposerMachine(
-  composer: Element | null,
-  machines: Machine[],
-  primaryHostId: string | null,
-) {
-  const machineLabel = composer
-    ?.querySelector('button[aria-label="Machine"]')
-    ?.textContent?.trim();
-  if (machineLabel) {
-    const selected = machines.find((machine) => machineLabel === machine.name);
-    if (selected) return selected;
-  }
-
-  const environmentLabel = composer
-    ?.querySelector('button[aria-label="Environment"] [data-promptbox-full-label]')
-    ?.textContent?.trim();
-  if (environmentLabel) {
-    const selected = machines.find((machine) => environmentLabel.startsWith(`${machine.name} ·`));
-    if (selected) return selected;
-  }
-
-  // The environment chip omits the machine name for the primary host.
-  return machines.find((machine) => machine.id === primaryHostId) ?? null;
-}
-
-function useComposerMachine(
-  machines: Machine[],
-  primaryHostId: string | null,
-  projectId: string | null,
-) {
-  const [machine, setMachine] = useState<Machine | null>(null);
-  useLayoutEffect(() => {
-    const composer = document.querySelector(PRIMARY_COMPOSER_SELECTOR);
-    const sync = () => {
-      const next = selectedComposerMachine(composer, machines, primaryHostId);
-      setMachine((current) => current === next ? current : next);
-    };
-    sync();
-    if (!composer) return;
-
-    const observer = new MutationObserver(sync);
-    observer.observe(composer, { childList: true, subtree: true, characterData: true });
-    return () => observer.disconnect();
-  }, [machines, primaryHostId, projectId]);
-  return machine;
-}
-
-function useHomepageSectionChrome(
+function useHomepageSectionVisibility(
   rootRef: { current: HTMLDivElement | null },
   visible: boolean,
-  title: string,
 ) {
   useLayoutEffect(() => {
     const section = rootRef.current?.closest("section");
     if (!section) return;
-    const heading = section.querySelector(":scope > h2");
 
     section.hidden = !visible;
-    section.classList.add("pt-4");
-    if (heading) heading.textContent = title;
 
     return () => {
       section.hidden = false;
-      section.classList.remove("pt-4");
-      if (heading) heading.textContent = "System Stats";
     };
-  }, [rootRef, title, visible]);
+  }, [rootRef, visible]);
 }
 
 function Meter({ frac, tone }: { frac: number; tone: "ok" | "warn" | "hot" }) {
@@ -290,12 +233,11 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
   const [error, setError] = useState<string | null>(null);
   const loadId = useRef(0);
   const load = useCallback(async () => {
-    if (!hostId) return;
     const requestId = ++loadId.current;
     try {
       const [nextCur, nextHist] = await Promise.all([
-        rpc.call("current", { hostId }),
-        rpc.call("history", { hostId, minutes }),
+        rpc.call("current", hostId ? { hostId } : null),
+        rpc.call("history", hostId ? { hostId, minutes } : { minutes }),
       ]);
       if (requestId !== loadId.current) return;
       setCur(nextCur as Current);
@@ -311,14 +253,13 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
     setCur(null);
     setHist(null);
     setError(null);
-    if (!hostId) return;
     void load();
     const timer = announceWatching
-      ? setInterval(() => void rpc.call("watching", { hostId }), 60_000)
+      ? setInterval(() => void rpc.call("watching", hostId ? { hostId } : null), 60_000)
       : null;
     if (announceWatching) {
       // Tell the sampler someone is looking, so it samples at the fast cadence.
-      void rpc.call("watching", { hostId });
+      void rpc.call("watching", hostId ? { hostId } : null);
     }
     return () => {
       loadId.current++;
@@ -329,7 +270,7 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
     // The sampler publishes for every connected host; only the machine on
     // screen needs a reload.
     const payload = event as { hostId?: string } | null;
-    if (payload?.hostId && payload.hostId !== hostId) return;
+    if (hostId && payload?.hostId && payload.hostId !== hostId) return;
     void load();
   });
   return { cur, hist, error };
@@ -342,13 +283,22 @@ function useHomeVisibility() {
   const rpc = useRpc<typeof rpcContract>();
   const connectionState = useRealtimeConnectionState();
   const [showOnHomepage, setShowOnHomepage] = useState<boolean | null>(null);
+  const [retryPending, setRetryPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const hasConnected = useRef(false);
-  const load = useCallback(async () => {
+  const load = useCallback(async (isRetry = false) => {
+    setError(null);
     try {
       const result = await rpc.call("homeVisibility", null);
       setShowOnHomepage(result.showOnHomepage);
-    } catch {
-      setShowOnHomepage(false);
+      setRetryPending(false);
+    } catch (cause) {
+      if (isRetry) {
+        setRetryPending(false);
+        setError(cause instanceof Error ? cause.message : "Unable to load Home visibility");
+      } else {
+        setRetryPending(true);
+      }
     }
   }, [rpc]);
   useEffect(() => {
@@ -359,10 +309,20 @@ function useHomeVisibility() {
     if (hasConnected.current) void load();
     hasConnected.current = true;
   }, [connectionState, load]);
+  useEffect(() => {
+    if (!retryPending || connectionState !== "connected") return;
+    const timer = setTimeout(() => {
+      setRetryPending(false);
+      void load(true);
+    }, 5_000);
+    return () => clearTimeout(timer);
+  }, [connectionState, load, retryPending]);
   useRealtime("system.home-visibility", (event) => {
     const payload = event as { showOnHomepage?: boolean } | null;
     if (typeof payload?.showOnHomepage === "boolean") {
       setShowOnHomepage(payload.showOnHomepage);
+      setRetryPending(false);
+      setError(null);
     }
   });
   const setVisible = useCallback(
@@ -371,16 +331,42 @@ function useHomeVisibility() {
       try {
         await rpc.call("setHomeVisibility", { showOnHomepage: next });
       } catch {
-        void load();
+        setShowOnHomepage(null);
+        void load(false);
       }
     },
     [load, rpc],
   );
-  return { showOnHomepage, setShowOnHomepage: setVisible };
+  return {
+    showOnHomepage,
+    setShowOnHomepage: setVisible,
+    error,
+    retry: () => void load(false),
+  };
 }
 
 function ShowOnHomeToggle() {
-  const { showOnHomepage, setShowOnHomepage } = useHomeVisibility();
+  const { showOnHomepage, setShowOnHomepage, error, retry } = useHomeVisibility();
+  if (error) {
+    return (
+      <div role="alert" className="flex items-center gap-1.5 text-xs text-destructive">
+        <span>Could not load Home visibility.</span>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={retry}
+          aria-label="Retry loading Home visibility"
+          className="h-auto px-2 py-1 text-destructive hover:bg-transparent hover:text-destructive"
+        >
+          Retry
+        </Button>
+      </div>
+    );
+  }
+  if (showOnHomepage === null) {
+    return <span className="px-2 py-1 text-xs text-muted-foreground">Loading Home visibility…</span>;
+  }
   const on = showOnHomepage === true;
   return (
     <Button
@@ -504,24 +490,18 @@ function VisibleHomeTiles({ hostId }: { hostId: string | null }) {
   );
 }
 
-function HomeTiles({ projectId }: { projectId: string | null }) {
+function HomeTiles() {
   const { showOnHomepage } = useHomeVisibility();
-  const { machines, primaryHostId } = useMachines();
-  const machine = useComposerMachine(machines, primaryHostId, projectId);
   const rootRef = useRef<HTMLDivElement>(null);
   // Unknown stays hidden until the persisted preference loads. Treating it as
   // visible caused the disabled section to flash its loading state on Home.
   const isVisible = showOnHomepage === true;
 
-  // homepageSection has no conditional-registration API, so this compatibility
-  // hook hides the host-owned heading together with the plugin content.
-  useHomepageSectionChrome(
-    rootRef,
-    isVisible,
-    machine ? `System Stats (${machine.name})` : "System Stats",
-  );
+  // homepageSection has no conditional-registration API, so hide the
+  // host-owned section together with the plugin content.
+  useHomepageSectionVisibility(rootRef, isVisible);
 
-  return <div ref={rootRef}>{isVisible ? <VisibleHomeTiles hostId={machine?.id ?? null} /> : null}</div>;
+  return <div ref={rootRef}>{isVisible ? <VisibleHomeTiles hostId={null} /> : null}</div>;
 }
 
 export default definePluginApp((app) => {

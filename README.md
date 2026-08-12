@@ -13,10 +13,10 @@ bb plugin install git:https://github.com/MGrin/bb-plugin-system.git@main
 the last hour, and top-process tables by CPU and by memory. A machine picker switches
 the whole dashboard between the primary bb machine and any connected enrolled machine.
 
-**Homepage tiles** — a compact CPU / memory / disk row for the machine selected in
-the Home composer. They are off by default; toggle **Show system stats on Home** in
-the top-right of the System panel to show or hide them. The saved choice applies
-instantly and is remembered.
+**Homepage tiles** — a compact CPU / memory / disk row for the primary bb machine.
+They are shown by default; toggle **Show system stats on Home** in the top-right of
+the System panel to show or hide them. The saved choice applies instantly and is
+remembered.
 
 **`bb system`** — the same data for agents, as text:
 

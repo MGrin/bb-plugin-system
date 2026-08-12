@@ -690,7 +690,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async homeVisibility() {
       const raw = await bb.storage.kv.get<string>("showOnHomepage");
-      return { showOnHomepage: raw === "1" };
+      return { showOnHomepage: raw !== "0" };
     },
     async setHomeVisibility(input) {
       await bb.storage.kv.set("showOnHomepage", input.showOnHomepage ? "1" : "0");
