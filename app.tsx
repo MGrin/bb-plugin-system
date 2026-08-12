@@ -1,5 +1,5 @@
 // bb-plugin-system frontend — System panel + homepage tiles.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   definePluginApp,
   useRealtime,
@@ -13,6 +13,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./components/ui/select";
+import { Button } from "./components/ui/button";
 import type { rpcContract } from "./server";
 
 type Sample = {
@@ -37,6 +38,23 @@ type Machine = {
 };
 
 const PRESSURE: Record<number, string> = { 1: "normal", 2: "warning", 4: "critical" };
+const SELECTED_MACHINE_KEY = "bb-plugin-system:selected-machine";
+
+function useHomepageSectionVisibility(
+  rootRef: { current: HTMLDivElement | null },
+  visible: boolean,
+) {
+  useLayoutEffect(() => {
+    const section = rootRef.current?.closest("section");
+    if (!section) return;
+
+    section.hidden = !visible;
+
+    return () => {
+      section.hidden = false;
+    };
+  }, [rootRef, visible]);
+}
 
 function Meter({ frac, tone }: { frac: number; tone: "ok" | "warn" | "hot" }) {
   const cls = tone === "hot" ? "bg-destructive" : tone === "warn" ? "bg-primary/70" : "bg-primary";
@@ -171,6 +189,43 @@ function MachineSelect(props: {
   );
 }
 
+function useSelectedMachine(machines: Machine[], primaryHostId: string | null) {
+  const [selectedHostId, setSelectedHostId] = useState<string | null>(() => {
+    try {
+      return window.localStorage.getItem(SELECTED_MACHINE_KEY);
+    } catch {
+      return null;
+    }
+  });
+  useEffect(() => {
+    if (!machines.length) return;
+    setSelectedHostId((current) =>
+      current && machines.some((machine) => machine.id === current)
+        ? current
+        : primaryHostId ?? machines[0]!.id,
+    );
+  }, [machines, primaryHostId]);
+  useEffect(() => {
+    if (!selectedHostId) return;
+    try {
+      window.localStorage.setItem(SELECTED_MACHINE_KEY, selectedHostId);
+    } catch {
+      // Client storage may be unavailable in hardened browser contexts. The
+      // in-memory selection still works for the current mount.
+    }
+  }, [selectedHostId]);
+  useEffect(() => {
+    const syncSelection = (event: StorageEvent) => {
+      if (event.key === SELECTED_MACHINE_KEY && event.newValue) {
+        setSelectedHostId(event.newValue);
+      }
+    };
+    window.addEventListener("storage", syncSelection);
+    return () => window.removeEventListener("storage", syncSelection);
+  }, []);
+  return [selectedHostId, setSelectedHostId] as const;
+}
+
 function useSystem(hostId: string | null, minutes: number, announceWatching: boolean) {
   const rpc = useRpc<typeof rpcContract>();
   const [cur, setCur] = useState<Current | null>(null);
@@ -178,12 +233,11 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
   const [error, setError] = useState<string | null>(null);
   const loadId = useRef(0);
   const load = useCallback(async () => {
-    if (!hostId) return;
     const requestId = ++loadId.current;
     try {
       const [nextCur, nextHist] = await Promise.all([
-        rpc.call("current", { hostId }),
-        rpc.call("history", { hostId, minutes }),
+        rpc.call("current", hostId ? { hostId } : null),
+        rpc.call("history", hostId ? { hostId, minutes } : { minutes }),
       ]);
       if (requestId !== loadId.current) return;
       setCur(nextCur as Current);
@@ -199,14 +253,13 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
     setCur(null);
     setHist(null);
     setError(null);
-    if (!hostId) return;
     void load();
     const timer = announceWatching
-      ? setInterval(() => void rpc.call("watching", { hostId }), 60_000)
+      ? setInterval(() => void rpc.call("watching", hostId ? { hostId } : null), 60_000)
       : null;
     if (announceWatching) {
       // Tell the sampler someone is looking, so it samples at the fast cadence.
-      void rpc.call("watching", { hostId });
+      void rpc.call("watching", hostId ? { hostId } : null);
     }
     return () => {
       loadId.current++;
@@ -217,30 +270,133 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
     // The sampler publishes for every connected host; only the machine on
     // screen needs a reload.
     const payload = event as { hostId?: string } | null;
-    if (payload?.hostId && payload.hostId !== hostId) return;
+    if (hostId && payload?.hostId && payload.hostId !== hostId) return;
     void load();
   });
   return { cur, hist, error };
 }
 
+// The homepage-tiles visibility toggle lives in the System panel, so both
+// slots (panel and homepage section) share this hook and stay in sync via
+// realtime — no host settings page, no save button, instant on click.
+function useHomeVisibility() {
+  const rpc = useRpc<typeof rpcContract>();
+  const connectionState = useRealtimeConnectionState();
+  const [showOnHomepage, setShowOnHomepage] = useState<boolean | null>(null);
+  const [retryPending, setRetryPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const hasConnected = useRef(false);
+  const load = useCallback(async (isRetry = false) => {
+    setError(null);
+    try {
+      const result = await rpc.call("homeVisibility", null);
+      setShowOnHomepage(result.showOnHomepage);
+      setRetryPending(false);
+    } catch (cause) {
+      if (isRetry) {
+        setRetryPending(false);
+        setError(cause instanceof Error ? cause.message : "Unable to load Home visibility");
+      } else {
+        setRetryPending(true);
+      }
+    }
+  }, [rpc]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useEffect(() => {
+    if (connectionState !== "connected") return;
+    if (hasConnected.current) void load();
+    hasConnected.current = true;
+  }, [connectionState, load]);
+  useEffect(() => {
+    if (!retryPending || connectionState !== "connected") return;
+    const timer = setTimeout(() => {
+      setRetryPending(false);
+      void load(true);
+    }, 5_000);
+    return () => clearTimeout(timer);
+  }, [connectionState, load, retryPending]);
+  useRealtime("system.home-visibility", (event) => {
+    const payload = event as { showOnHomepage?: boolean } | null;
+    if (typeof payload?.showOnHomepage === "boolean") {
+      setShowOnHomepage(payload.showOnHomepage);
+      setRetryPending(false);
+      setError(null);
+    }
+  });
+  const setVisible = useCallback(
+    async (next: boolean) => {
+      setShowOnHomepage(next);
+      try {
+        await rpc.call("setHomeVisibility", { showOnHomepage: next });
+      } catch {
+        setShowOnHomepage(null);
+        void load(false);
+      }
+    },
+    [load, rpc],
+  );
+  return {
+    showOnHomepage,
+    setShowOnHomepage: setVisible,
+    error,
+    retry: () => void load(false),
+  };
+}
+
+function ShowOnHomeToggle() {
+  const { showOnHomepage, setShowOnHomepage, error, retry } = useHomeVisibility();
+  if (error) {
+    return (
+      <div role="alert" className="flex items-center gap-1.5 text-xs text-destructive">
+        <span>Could not load Home visibility.</span>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={retry}
+          aria-label="Retry loading Home visibility"
+          className="h-auto px-2 py-1 text-destructive hover:bg-transparent hover:text-destructive"
+        >
+          Retry
+        </Button>
+      </div>
+    );
+  }
+  if (showOnHomepage === null) {
+    return <span className="px-2 py-1 text-xs text-muted-foreground">Loading Home visibility…</span>;
+  }
+  const on = showOnHomepage === true;
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      onClick={() => setShowOnHomepage(!on)}
+      aria-pressed={on}
+      aria-label={on ? "Hide system stats from Home" : "Show system stats on Home"}
+      className="h-auto gap-1.5 px-2 py-1 text-muted-foreground hover:bg-transparent hover:text-muted-foreground aria-pressed:bg-transparent aria-pressed:text-muted-foreground aria-pressed:hover:bg-transparent"
+    >
+      <span aria-hidden className={on ? "text-primary" : "text-muted-foreground/60"}>
+        {on ? "●" : "○"}
+      </span>
+      <span>Show system stats on Home: {on ? "On" : "Off"}</span>
+    </Button>
+  );
+}
+
 function SystemPanel() {
   const { machines, primaryHostId, error: machineError } = useMachines();
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
-  useEffect(() => {
-    if (!machines.length) return;
-    setSelectedHostId((current) =>
-      current && machines.some((machine) => machine.id === current)
-        ? current
-        : primaryHostId ?? machines[0]!.id,
-    );
-  }, [machines, primaryHostId]);
+  const [selectedHostId, setSelectedHostId] = useSelectedMachine(machines, primaryHostId);
   const { cur, hist, error } = useSystem(selectedHostId, 60, true);
   const s = cur?.sample;
   const samples = hist?.samples ?? [];
   return (
     <div className="p-4 md:p-5 overflow-y-auto h-full">
       <div className="mx-auto w-full max-w-3xl space-y-4">
-        <div className="flex justify-end">
+        <div className="flex items-center justify-end gap-2">
+          <ShowOnHomeToggle />
           {selectedHostId && machines.length > 0 ? (
             <MachineSelect machines={machines} value={selectedHostId} onChange={setSelectedHostId} />
           ) : null}
@@ -304,27 +460,51 @@ function SystemDetails({ current, samples }: { current: Current; samples: Sample
   );
 }
 
-function HomeTiles() {
-  const { primaryHostId } = useMachines();
-  const { cur } = useSystem(primaryHostId, 5, false);
+function VisibleHomeTiles({ hostId }: { hostId: string | null }) {
+  const { cur, error } = useSystem(hostId, 5, false);
   const s = cur?.sample;
-  if (!s) return null;
   return (
-    <div className="grid grid-cols-3 gap-3">
-      <Tile label="CPU" value={`${Math.round(s.cpuPct)}%`} sub={`${s.cpuCount} cores`} frac={s.cpuPct / 100} />
-      <Tile
-        label="Memory"
-        value={`${Math.round(s.memUsedFrac * 100)}%`}
-        sub={`${(s.memUsedMb / 1024).toFixed(1)} GB used`}
-        frac={s.memUsedFrac}
-        hot={s.pressureLevel >= 2}
-      />
-      <Tile label="Disk" value={`${Math.round((s.diskUsedGb / (s.diskTotalGb || 1)) * 100)}%`} sub={`${s.diskTotalGb - s.diskUsedGb} GB free`} frac={s.diskUsedGb / (s.diskTotalGb || 1)} />
+    <div>
+      {!s && error ? (
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+          Could not load system stats: {error}
+        </div>
+      ) : !s ? (
+        <div className="py-4 text-center text-sm text-muted-foreground">
+          Sampling… first data arrives shortly.
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <Tile label="CPU" value={`${Math.round(s.cpuPct)}%`} sub={`${s.cpuCount} cores`} frac={s.cpuPct / 100} />
+          <Tile
+            label="Memory"
+            value={`${Math.round(s.memUsedFrac * 100)}%`}
+            sub={`${(s.memUsedMb / 1024).toFixed(1)} GB used`}
+            frac={s.memUsedFrac}
+            hot={s.pressureLevel >= 2}
+          />
+          <Tile label="Disk" value={`${Math.round((s.diskUsedGb / (s.diskTotalGb || 1)) * 100)}%`} sub={`${s.diskTotalGb - s.diskUsedGb} GB free`} frac={s.diskUsedGb / (s.diskTotalGb || 1)} />
+        </div>
+      )}
     </div>
   );
 }
 
+function HomeTiles() {
+  const { showOnHomepage } = useHomeVisibility();
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Unknown stays hidden until the persisted preference loads. Treating it as
+  // visible caused the disabled section to flash its loading state on Home.
+  const isVisible = showOnHomepage === true;
+
+  // homepageSection has no conditional-registration API, so hide the
+  // host-owned section together with the plugin content.
+  useHomepageSectionVisibility(rootRef, isVisible);
+
+  return <div ref={rootRef}>{isVisible ? <VisibleHomeTiles hostId={null} /> : null}</div>;
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({ id: "system", title: "System", icon: "Activity", path: "system", component: SystemPanel });
-  app.slots.homepageSection({ id: "system-tiles", title: "System", component: HomeTiles });
+  app.slots.homepageSection({ id: "system-tiles", title: "System Stats", component: HomeTiles });
 });

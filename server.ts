@@ -87,6 +87,16 @@ export const rpcContract = defineRpcContract({
   },
   // The panel calls this while mounted so the sampler knows someone is watching.
   watching: { input: machineInput, output: z.object({ ok: z.boolean() }) },
+  // Homepage-tiles visibility. Stored by the plugin itself (not the host's
+  // settings page) so the panel's toggle takes effect the moment it is clicked.
+  homeVisibility: {
+    input: z.null(),
+    output: z.object({ showOnHomepage: z.boolean() }),
+  },
+  setHomeVisibility: {
+    input: z.object({ showOnHomepage: z.boolean() }).strict(),
+    output: z.object({ ok: z.boolean() }),
+  },
 });
 
 async function pressureLevel(): Promise<number> {
@@ -676,6 +686,15 @@ export default async function plugin(bb: BbPluginApi) {
     watching(input) {
       const hostId = input?.hostId ?? primaryHostId;
       watchingUntil.set(hostId, Date.now() + 90_000);
+      return { ok: true };
+    },
+    async homeVisibility() {
+      const raw = await bb.storage.kv.get<string>("showOnHomepage");
+      return { showOnHomepage: raw !== "0" };
+    },
+    async setHomeVisibility(input) {
+      await bb.storage.kv.set("showOnHomepage", input.showOnHomepage ? "1" : "0");
+      bb.realtime.publish("system.home-visibility", { showOnHomepage: input.showOnHomepage });
       return { ok: true };
     },
   });
