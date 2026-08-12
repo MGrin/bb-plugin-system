@@ -13,6 +13,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./components/ui/select";
+import { Button } from "./components/ui/button";
 import type { rpcContract } from "./server";
 
 type Sample = {
@@ -339,7 +340,9 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
 // realtime — no host settings page, no save button, instant on click.
 function useHomeVisibility() {
   const rpc = useRpc<typeof rpcContract>();
+  const connectionState = useRealtimeConnectionState();
   const [showOnHomepage, setShowOnHomepage] = useState<boolean | null>(null);
+  const hasConnected = useRef(false);
   const load = useCallback(async () => {
     try {
       const result = await rpc.call("homeVisibility", null);
@@ -351,6 +354,11 @@ function useHomeVisibility() {
   useEffect(() => {
     void load();
   }, [load]);
+  useEffect(() => {
+    if (connectionState !== "connected") return;
+    if (hasConnected.current) void load();
+    hasConnected.current = true;
+  }, [connectionState, load]);
   useRealtime("system.home-visibility", (event) => {
     const payload = event as { showOnHomepage?: boolean } | null;
     if (typeof payload?.showOnHomepage === "boolean") {
@@ -375,18 +383,20 @@ function ShowOnHomeToggle() {
   const { showOnHomepage, setShowOnHomepage } = useHomeVisibility();
   const on = showOnHomepage === true;
   return (
-    <button
+    <Button
       type="button"
+      variant="ghost"
+      size="sm"
       onClick={() => setShowOnHomepage(!on)}
       aria-pressed={on}
-      title={on ? "Hide the CPU / memory / disk summary from Home" : "Show the CPU / memory / disk summary on Home"}
-      className="flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground"
+      aria-label={on ? "Hide system stats from Home" : "Show system stats on Home"}
+      className="h-auto gap-1.5 px-2 py-1 text-muted-foreground hover:bg-transparent hover:text-muted-foreground aria-pressed:bg-transparent aria-pressed:text-muted-foreground aria-pressed:hover:bg-transparent"
     >
       <span aria-hidden className={on ? "text-primary" : "text-muted-foreground/60"}>
         {on ? "●" : "○"}
       </span>
       <span>Show system stats on Home: {on ? "On" : "Off"}</span>
-    </button>
+    </Button>
   );
 }
 
@@ -465,11 +475,15 @@ function SystemDetails({ current, samples }: { current: Current; samples: Sample
 }
 
 function VisibleHomeTiles({ hostId }: { hostId: string | null }) {
-  const { cur } = useSystem(hostId, 5, false);
+  const { cur, error } = useSystem(hostId, 5, false);
   const s = cur?.sample;
   return (
     <div>
-      {!s ? (
+      {!s && error ? (
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+          Could not load system stats: {error}
+        </div>
+      ) : !s ? (
         <div className="py-4 text-center text-sm text-muted-foreground">
           Sampling… first data arrives shortly.
         </div>
