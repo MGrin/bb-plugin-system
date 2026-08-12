@@ -1,5 +1,5 @@
 // bb-plugin-system frontend — System panel + homepage tiles.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   definePluginApp,
   useRealtime,
@@ -37,6 +37,44 @@ type Machine = {
 };
 
 const PRESSURE: Record<number, string> = { 1: "normal", 2: "warning", 4: "critical" };
+const SELECTED_MACHINE_KEY = "bb-plugin-system:selected-machine";
+
+function selectedComposerMachine(machines: Machine[], primaryHostId: string | null) {
+  const composer = document.querySelector('[data-app-composer-role="primary"]');
+  const machineLabel = composer
+    ?.querySelector('button[aria-label="Machine"]')
+    ?.textContent?.trim();
+  if (machineLabel) {
+    const selected = machines.find((machine) => machineLabel === machine.name);
+    if (selected) return selected;
+  }
+
+  const environmentLabel = composer
+    ?.querySelector('button[aria-label="Environment"] [data-promptbox-full-label]')
+    ?.textContent?.trim();
+  if (environmentLabel) {
+    const selected = machines.find((machine) => environmentLabel.startsWith(`${machine.name} ·`));
+    if (selected) return selected;
+  }
+
+  // The environment chip omits the machine name for the primary host.
+  return machines.find((machine) => machine.id === primaryHostId) ?? null;
+}
+
+function useComposerMachine(machines: Machine[], primaryHostId: string | null) {
+  const [machine, setMachine] = useState<Machine | null>(null);
+  useLayoutEffect(() => {
+    const sync = () => {
+      const next = selectedComposerMachine(machines, primaryHostId);
+      setMachine((current) => current?.id === next?.id ? current : next);
+    };
+    sync();
+    const observer = new MutationObserver(sync);
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, [machines, primaryHostId]);
+  return machine;
+}
 
 function Meter({ frac, tone }: { frac: number; tone: "ok" | "warn" | "hot" }) {
   const cls = tone === "hot" ? "bg-destructive" : tone === "warn" ? "bg-primary/70" : "bg-primary";
@@ -171,6 +209,43 @@ function MachineSelect(props: {
   );
 }
 
+function useSelectedMachine(machines: Machine[], primaryHostId: string | null) {
+  const [selectedHostId, setSelectedHostId] = useState<string | null>(() => {
+    try {
+      return window.localStorage.getItem(SELECTED_MACHINE_KEY);
+    } catch {
+      return null;
+    }
+  });
+  useEffect(() => {
+    if (!machines.length) return;
+    setSelectedHostId((current) =>
+      current && machines.some((machine) => machine.id === current)
+        ? current
+        : primaryHostId ?? machines[0]!.id,
+    );
+  }, [machines, primaryHostId]);
+  useEffect(() => {
+    if (!selectedHostId) return;
+    try {
+      window.localStorage.setItem(SELECTED_MACHINE_KEY, selectedHostId);
+    } catch {
+      // Client storage may be unavailable in hardened browser contexts. The
+      // in-memory selection still works for the current mount.
+    }
+  }, [selectedHostId]);
+  useEffect(() => {
+    const syncSelection = (event: StorageEvent) => {
+      if (event.key === SELECTED_MACHINE_KEY && event.newValue) {
+        setSelectedHostId(event.newValue);
+      }
+    };
+    window.addEventListener("storage", syncSelection);
+    return () => window.removeEventListener("storage", syncSelection);
+  }, []);
+  return [selectedHostId, setSelectedHostId] as const;
+}
+
 function useSystem(hostId: string | null, minutes: number, announceWatching: boolean) {
   const rpc = useRpc<typeof rpcContract>();
   const [cur, setCur] = useState<Current | null>(null);
@@ -223,24 +298,73 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
   return { cur, hist, error };
 }
 
+// The homepage-tiles visibility toggle lives in the System panel, so both
+// slots (panel and homepage section) share this hook and stay in sync via
+// realtime — no host settings page, no save button, instant on click.
+function useHomeVisibility() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [showOnHomepage, setShowOnHomepage] = useState<boolean | null>(null);
+  const load = useCallback(async () => {
+    try {
+      const result = await rpc.call("homeVisibility", null);
+      setShowOnHomepage(result.showOnHomepage);
+    } catch {
+      setShowOnHomepage(false);
+    }
+  }, [rpc]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useRealtime("system.home-visibility", (event) => {
+    const payload = event as { showOnHomepage?: boolean } | null;
+    if (typeof payload?.showOnHomepage === "boolean") {
+      setShowOnHomepage(payload.showOnHomepage);
+    }
+  });
+  const setVisible = useCallback(
+    async (next: boolean) => {
+      setShowOnHomepage(next);
+      try {
+        await rpc.call("setHomeVisibility", { showOnHomepage: next });
+      } catch {
+        void load();
+      }
+    },
+    [load, rpc],
+  );
+  return { showOnHomepage, setShowOnHomepage: setVisible };
+}
+
+function ShowOnHomeToggle() {
+  const { showOnHomepage, setShowOnHomepage } = useHomeVisibility();
+  const on = showOnHomepage === true;
+  return (
+    <button
+      type="button"
+      onClick={() => setShowOnHomepage(!on)}
+      aria-pressed={on}
+      title={on ? "Hide the CPU / memory / disk summary from Home" : "Show the CPU / memory / disk summary on Home"}
+      className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+    >
+      <span aria-hidden className={on ? "text-primary" : "text-muted-foreground/60"}>
+        {on ? "●" : "○"}
+      </span>
+      Show system stats on Home: {on ? "On" : "Off"}
+    </button>
+  );
+}
+
 function SystemPanel() {
   const { machines, primaryHostId, error: machineError } = useMachines();
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
-  useEffect(() => {
-    if (!machines.length) return;
-    setSelectedHostId((current) =>
-      current && machines.some((machine) => machine.id === current)
-        ? current
-        : primaryHostId ?? machines[0]!.id,
-    );
-  }, [machines, primaryHostId]);
+  const [selectedHostId, setSelectedHostId] = useSelectedMachine(machines, primaryHostId);
   const { cur, hist, error } = useSystem(selectedHostId, 60, true);
   const s = cur?.sample;
   const samples = hist?.samples ?? [];
   return (
     <div className="p-4 md:p-5 overflow-y-auto h-full">
       <div className="mx-auto w-full max-w-3xl space-y-4">
-        <div className="flex justify-end">
+        <div className="flex items-center justify-end gap-2">
+          <ShowOnHomeToggle />
           {selectedHostId && machines.length > 0 ? (
             <MachineSelect machines={machines} value={selectedHostId} onChange={setSelectedHostId} />
           ) : null}
@@ -304,27 +428,64 @@ function SystemDetails({ current, samples }: { current: Current; samples: Sample
   );
 }
 
-function HomeTiles() {
-  const { primaryHostId } = useMachines();
-  const { cur } = useSystem(primaryHostId, 5, false);
+function VisibleHomeTiles({ hostId }: { hostId: string | null }) {
+  const { cur } = useSystem(hostId, 5, false);
   const s = cur?.sample;
-  if (!s) return null;
   return (
-    <div className="grid grid-cols-3 gap-3">
-      <Tile label="CPU" value={`${Math.round(s.cpuPct)}%`} sub={`${s.cpuCount} cores`} frac={s.cpuPct / 100} />
-      <Tile
-        label="Memory"
-        value={`${Math.round(s.memUsedFrac * 100)}%`}
-        sub={`${(s.memUsedMb / 1024).toFixed(1)} GB used`}
-        frac={s.memUsedFrac}
-        hot={s.pressureLevel >= 2}
-      />
-      <Tile label="Disk" value={`${Math.round((s.diskUsedGb / (s.diskTotalGb || 1)) * 100)}%`} sub={`${s.diskTotalGb - s.diskUsedGb} GB free`} frac={s.diskUsedGb / (s.diskTotalGb || 1)} />
+    <div>
+      {!s ? (
+        <div className="py-4 text-center text-sm text-muted-foreground">
+          Sampling… first data arrives shortly.
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <Tile label="CPU" value={`${Math.round(s.cpuPct)}%`} sub={`${s.cpuCount} cores`} frac={s.cpuPct / 100} />
+          <Tile
+            label="Memory"
+            value={`${Math.round(s.memUsedFrac * 100)}%`}
+            sub={`${(s.memUsedMb / 1024).toFixed(1)} GB used`}
+            frac={s.memUsedFrac}
+            hot={s.pressureLevel >= 2}
+          />
+          <Tile label="Disk" value={`${Math.round((s.diskUsedGb / (s.diskTotalGb || 1)) * 100)}%`} sub={`${s.diskTotalGb - s.diskUsedGb} GB free`} frac={s.diskUsedGb / (s.diskTotalGb || 1)} />
+        </div>
+      )}
     </div>
   );
 }
 
+function HomeTiles() {
+  const { showOnHomepage } = useHomeVisibility();
+  const { machines, primaryHostId } = useMachines();
+  const machine = useComposerMachine(machines, primaryHostId);
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Unknown stays hidden until the persisted preference loads. Treating it as
+  // visible caused the disabled section to flash its loading state on Home.
+  const isVisible = showOnHomepage === true;
+
+  // homepageSection has no conditional-registration API. Hide the host-owned
+  // heading together with our content so disabling the setting removes the
+  // complete section instead of leaving an orphaned "System" label behind.
+  useLayoutEffect(() => {
+    const section = rootRef.current?.closest("section");
+    if (!section) return;
+    const heading = section.querySelector(":scope > h2");
+    section.hidden = !isVisible;
+    section.classList.add("pt-4");
+    if (heading) {
+      heading.textContent = machine ? `System Stats (${machine.name})` : "System Stats";
+    }
+    return () => {
+      section.hidden = false;
+      section.classList.remove("pt-4");
+      if (heading) heading.textContent = "System Stats";
+    };
+  }, [isVisible, machine]);
+
+  return <div ref={rootRef}>{isVisible ? <VisibleHomeTiles hostId={machine?.id ?? null} /> : null}</div>;
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({ id: "system", title: "System", icon: "Activity", path: "system", component: SystemPanel });
-  app.slots.homepageSection({ id: "system-tiles", title: "System", component: HomeTiles });
+  app.slots.homepageSection({ id: "system-tiles", title: "System Stats", component: HomeTiles });
 });
