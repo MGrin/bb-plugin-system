@@ -38,9 +38,16 @@ type Machine = {
 
 const PRESSURE: Record<number, string> = { 1: "normal", 2: "warning", 4: "critical" };
 const SELECTED_MACHINE_KEY = "bb-plugin-system:selected-machine";
+const PRIMARY_COMPOSER_SELECTOR = '[data-app-composer-role="primary"]';
 
-function selectedComposerMachine(machines: Machine[], primaryHostId: string | null) {
-  const composer = document.querySelector('[data-app-composer-role="primary"]');
+// Compatibility boundary: homepageSection currently exposes the project but
+// not the new-thread composer's selected host. Keep the host-DOM fallback in
+// these helpers so it is easy to remove when the SDK grows that field.
+function selectedComposerMachine(
+  composer: Element | null,
+  machines: Machine[],
+  primaryHostId: string | null,
+) {
   const machineLabel = composer
     ?.querySelector('button[aria-label="Machine"]')
     ?.textContent?.trim();
@@ -61,19 +68,48 @@ function selectedComposerMachine(machines: Machine[], primaryHostId: string | nu
   return machines.find((machine) => machine.id === primaryHostId) ?? null;
 }
 
-function useComposerMachine(machines: Machine[], primaryHostId: string | null) {
+function useComposerMachine(
+  machines: Machine[],
+  primaryHostId: string | null,
+  projectId: string | null,
+) {
   const [machine, setMachine] = useState<Machine | null>(null);
   useLayoutEffect(() => {
+    const composer = document.querySelector(PRIMARY_COMPOSER_SELECTOR);
     const sync = () => {
-      const next = selectedComposerMachine(machines, primaryHostId);
-      setMachine((current) => current?.id === next?.id ? current : next);
+      const next = selectedComposerMachine(composer, machines, primaryHostId);
+      setMachine((current) => current === next ? current : next);
     };
     sync();
+    if (!composer) return;
+
     const observer = new MutationObserver(sync);
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    observer.observe(composer, { childList: true, subtree: true, characterData: true });
     return () => observer.disconnect();
-  }, [machines, primaryHostId]);
+  }, [machines, primaryHostId, projectId]);
   return machine;
+}
+
+function useHomepageSectionChrome(
+  rootRef: { current: HTMLDivElement | null },
+  visible: boolean,
+  title: string,
+) {
+  useLayoutEffect(() => {
+    const section = rootRef.current?.closest("section");
+    if (!section) return;
+    const heading = section.querySelector(":scope > h2");
+
+    section.hidden = !visible;
+    section.classList.add("pt-4");
+    if (heading) heading.textContent = title;
+
+    return () => {
+      section.hidden = false;
+      section.classList.remove("pt-4");
+      if (heading) heading.textContent = "System Stats";
+    };
+  }, [rootRef, title, visible]);
 }
 
 function Meter({ frac, tone }: { frac: number; tone: "ok" | "warn" | "hot" }) {
@@ -344,12 +380,12 @@ function ShowOnHomeToggle() {
       onClick={() => setShowOnHomepage(!on)}
       aria-pressed={on}
       title={on ? "Hide the CPU / memory / disk summary from Home" : "Show the CPU / memory / disk summary on Home"}
-      className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+      className="flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground"
     >
       <span aria-hidden className={on ? "text-primary" : "text-muted-foreground/60"}>
         {on ? "●" : "○"}
       </span>
-      Show system stats on Home: {on ? "On" : "Off"}
+      <span>Show system stats on Home: {on ? "On" : "Off"}</span>
     </button>
   );
 }
@@ -454,33 +490,22 @@ function VisibleHomeTiles({ hostId }: { hostId: string | null }) {
   );
 }
 
-function HomeTiles() {
+function HomeTiles({ projectId }: { projectId: string | null }) {
   const { showOnHomepage } = useHomeVisibility();
   const { machines, primaryHostId } = useMachines();
-  const machine = useComposerMachine(machines, primaryHostId);
+  const machine = useComposerMachine(machines, primaryHostId, projectId);
   const rootRef = useRef<HTMLDivElement>(null);
   // Unknown stays hidden until the persisted preference loads. Treating it as
   // visible caused the disabled section to flash its loading state on Home.
   const isVisible = showOnHomepage === true;
 
-  // homepageSection has no conditional-registration API. Hide the host-owned
-  // heading together with our content so disabling the setting removes the
-  // complete section instead of leaving an orphaned "System" label behind.
-  useLayoutEffect(() => {
-    const section = rootRef.current?.closest("section");
-    if (!section) return;
-    const heading = section.querySelector(":scope > h2");
-    section.hidden = !isVisible;
-    section.classList.add("pt-4");
-    if (heading) {
-      heading.textContent = machine ? `System Stats (${machine.name})` : "System Stats";
-    }
-    return () => {
-      section.hidden = false;
-      section.classList.remove("pt-4");
-      if (heading) heading.textContent = "System Stats";
-    };
-  }, [isVisible, machine]);
+  // homepageSection has no conditional-registration API, so this compatibility
+  // hook hides the host-owned heading together with the plugin content.
+  useHomepageSectionChrome(
+    rootRef,
+    isVisible,
+    machine ? `System Stats (${machine.name})` : "System Stats",
+  );
 
   return <div ref={rootRef}>{isVisible ? <VisibleHomeTiles hostId={machine?.id ?? null} /> : null}</div>;
 }
