@@ -527,7 +527,11 @@ export default async function plugin(bb: BbPluginApi) {
         topMem: current.topMem,
         uptime: current.uptime,
       });
-      bb.realtime.publish("system.sample", { hostId, at: current.sample.ts });
+      bb.realtime.publish("system.sample", {
+        hostId,
+        isPrimary: hostId === primaryHostId,
+        at: current.sample.ts,
+      });
       return current;
     })().finally(() => sampling.delete(hostId));
     sampling.set(hostId, promise);
