@@ -269,8 +269,12 @@ function useSystem(hostId: string | null, minutes: number, announceWatching: boo
   useRealtime("system.sample", (event) => {
     // The sampler publishes for every connected host; only the machine on
     // screen needs a reload.
-    const payload = event as { hostId?: string } | null;
-    if (hostId && payload?.hostId && payload.hostId !== hostId) return;
+    const payload = event as { hostId?: string; isPrimary?: boolean } | null;
+    if (hostId) {
+      if (payload?.hostId && payload.hostId !== hostId) return;
+    } else if (payload && payload.isPrimary === false) {
+      return;
+    }
     void load();
   });
   return { cur, hist, error };
@@ -310,13 +314,13 @@ function useHomeVisibility() {
     hasConnected.current = true;
   }, [connectionState, load]);
   useEffect(() => {
-    if (!retryPending || connectionState !== "connected") return;
+    if (!retryPending) return;
     const timer = setTimeout(() => {
       setRetryPending(false);
       void load(true);
     }, 5_000);
     return () => clearTimeout(timer);
-  }, [connectionState, load, retryPending]);
+  }, [load, retryPending]);
   useRealtime("system.home-visibility", (event) => {
     const payload = event as { showOnHomepage?: boolean } | null;
     if (typeof payload?.showOnHomepage === "boolean") {
