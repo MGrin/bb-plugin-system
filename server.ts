@@ -18,7 +18,7 @@
 // Top processes stay on our own `ps`: systeminformation's darwin implementation
 // shells the same `ps` with nine more columns and takes its decayed pcpu verbatim,
 // so there is nothing to gain and a 22ms spawn to lose.
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import si from "systeminformation";
@@ -213,6 +213,34 @@ type CurrentData = {
   topMem: z.infer<typeof procShape>[];
   uptime: string;
 };
+
+/**
+ * Which commit is this PROCESS running? (MX-139/MX-141)
+ *
+ * bb bundles a `path:` plugin FROM SOURCE at reload, so a revision read here — at module
+ * load, the same moment — is by construction the code now executing. Nothing else can say:
+ * `bb plugin list` prints `running` and the source path but no revision, `bb plugin source`
+ * has none to record for a path: source, and dist/ is NOT the loaded artifact (its mtime was
+ * measured lying by 15 minutes). So a checkout can sit clean on main, every drift check
+ * green, while the process runs something older.
+ *
+ * Synchronous on purpose: the value must be fixed before anything can observe it, and it is
+ * one git call per load. Failure yields rev: null rather than a guess — a tarball install has
+ * no git dir, and that must stay distinguishable from a real mismatch so a checker reports
+ * UNKNOWN rather than OK. `dirty` rides along because a bundle built from an edited tree
+ * matches NO commit, and comparing revisions alone would call that a match.
+ */
+const BUILD_STAMP: { rev: string | null; dirty: boolean | null; sourceDir: string; loadedAt: string; why: string | null } = (() => {
+  const sourceDir = import.meta.dirname;
+  const loadedAt = new Date().toISOString();
+  try {
+    const git = (args: string[]): string =>
+      execFileSync("git", ["-C", sourceDir, ...args], { encoding: "utf8", timeout: 5000 }).trim();
+    return { rev: git(["rev-parse", "HEAD"]), dirty: git(["status", "--porcelain"]).length > 0, sourceDir, loadedAt, why: null };
+  } catch (e) {
+    return { rev: null, dirty: null, sourceDir, loadedAt, why: e instanceof Error ? e.message : String(e) };
+  }
+})();
 
 export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
@@ -717,9 +745,26 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "overview", summary: "Current CPU/memory/disk snapshot (default)", usage: "bb system [overview]" },
       { name: "top", summary: "Top processes by CPU and memory", usage: "bb system top" },
       { name: "history", summary: "Compact trend for the last N minutes", usage: "bb system history [minutes=60]" },
+      {
+        name: "build",
+        summary: "Which commit this RUNNING process was loaded from (not the checkout)",
+        usage: "bb system build [--json]",
+      },
     ],
     async run(argv) {
       const cmd = argv[0] ?? "overview";
+
+      // Answered FIRST, before anything shells out or reads state: "what is running" must
+      // stay answerable when the thing running is broken.
+      if (cmd === "build") {
+        if (argv.includes("--json")) return { exitCode: 0, stdout: JSON.stringify(BUILD_STAMP) };
+        const dirty = BUILD_STAMP.dirty === null ? "" : BUILD_STAMP.dirty ? " +dirty" : "";
+        const why = BUILD_STAMP.why ? `  (${BUILD_STAMP.why})` : "";
+        return {
+          exitCode: 0,
+          stdout: `loaded ${BUILD_STAMP.rev ?? "unknown"}${dirty} from ${BUILD_STAMP.sourceDir} at ${BUILD_STAMP.loadedAt}${why}`,
+        };
+      }
       if (cmd === "top") {
         const { topCpu, topMem } = await topProcesses();
         const fmt = (p: { pid: number; cpu: number; memMb: number; command: string }) =>
