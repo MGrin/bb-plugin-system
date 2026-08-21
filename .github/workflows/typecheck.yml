@@ -1,0 +1,38 @@
+# The type gate. There is no test suite in this repo to run.
+#
+# Until MX-222 this repo's only CI job was `managed-install`, which proves the
+# plugin BUILDS from a git install and says nothing about whether it works:
+# `bb plugin build` bundles WITHOUT typechecking, so a type error anywhere in
+# server.ts (34k) or app.tsx still produced a green check.
+#
+# This is a SEPARATE job rather than more steps on managed-install, because
+# that job installs `--omit=dev` — typescript and @types/* are absent by the
+# time it ends.
+#
+# What a green run here covers: `tsc --noEmit` under `strict` with
+# `skipLibCheck: false`, over server.ts, app.tsx, components, lib, hooks and
+# types. What it does NOT cover: this repo has ZERO test files, so no line of
+# it is ever EXECUTED in CI. Green means it compiles, not that it works — a
+# weaker claim than the sibling plugins' Test job, and deliberately named so.
+name: Typecheck
+
+on:
+  pull_request:
+  push:
+    branches: [main, main-public]
+  workflow_dispatch:
+
+jobs:
+  typecheck:
+    name: tsc --noEmit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # `npm ci` rather than `npm install`: it installs the lockfile exactly and
+      # fails when package.json and package-lock.json disagree, so CI checks the
+      # tree a fresh clone would get.
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck

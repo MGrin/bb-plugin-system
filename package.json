@@ -2,6 +2,9 @@
   "name": "bb-plugin-system",
   "version": "0.1.0",
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "engines": {
     "bb": ">=0.36",
     "bbPluginSdk": "^0.4.1"
