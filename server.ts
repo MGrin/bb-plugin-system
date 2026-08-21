@@ -808,3 +808,6 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.log.info("system plugin loaded");
 }
+
+const mx222NegativeControl: number = "not a number";
+void mx222NegativeControl;
