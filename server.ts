@@ -20,7 +20,7 @@
 // so there is nothing to gain and a 22ms spawn to lose.
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import si from "systeminformation";
 import { z } from "zod";
 
