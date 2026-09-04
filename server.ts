@@ -23,6 +23,13 @@ import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import si from "systeminformation";
 import { z } from "zod";
+import {
+  batteryFromRemote,
+  batteryFromSi,
+  batteryStateShape,
+  decodeBattery,
+  encodeBattery,
+} from "./lib/battery";
 
 const run = promisify(execFile);
 const ACTIVE_MS = 15_000; // a thread is running a turn, or the panel is open
@@ -46,6 +53,10 @@ const sampleShape = z.object({
   swapUsedMb: z.number(),
   diskTotalGb: z.number(),
   diskUsedGb: z.number(),
+  // Optional on purpose, at every layer: absent means the sampler could not
+  // tell, which is a different answer from "this machine has no battery"
+  // ({ present: false }) and from any number at all. See lib/battery.ts.
+  battery: batteryStateShape.optional(),
 });
 type Sample = z.infer<typeof sampleShape>;
 
@@ -133,6 +144,15 @@ async function topProcesses() {
 const REMOTE_SAMPLE_SCRIPT = String.raw`
 set -eu
 platform=$(uname -s)
+# Battery: a remote host may legitimately BE a desktop, so these stay empty
+# unless the host actually answered. An empty battery_present emits NO line at
+# all, which the parser reads as UNKNOWN — distinct from battery_present=0,
+# which is the host saying it has no battery.
+battery_present=
+battery_pct=
+battery_minutes=
+battery_charging=0
+battery_ac=0
 if [ "$platform" = "Darwin" ]; then
   cpu_count=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
   cpu_pct=$(top -l 2 -n 0 -s 1 2>/dev/null | awk '/CPU usage/ { idle=$7 } END { gsub(/%/, "", idle); if (idle == "") idle=100; printf "%.1f", 100-idle }')
@@ -158,6 +178,23 @@ if [ "$platform" = "Darwin" ]; then
     }')
   pressure=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1)
   swap_used_kb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{ for (i=1;i<=NF;i++) if ($i=="used") { v=$(i+2); sub(/M$/, "", v); printf "%.0f", v*1024 } }')
+  # pmset prints an InternalBattery line only on machines that have one; a Mac
+  # mini/Studio prints the AC line and nothing else. pmset missing entirely
+  # leaves battery_present empty => UNKNOWN.
+  batt=$(pmset -g batt 2>/dev/null || true)
+  if [ -n "$batt" ]; then
+    case "$batt" in
+      *InternalBattery*)
+        battery_present=1
+        battery_pct=$(printf '%s\n' "$batt" | sed -n 's/.*[^0-9]\([0-9][0-9]*\)%.*/\1/p' | head -n 1)
+        # "1:23 remaining" -> 83. "(no estimate)" and "0:00" yield nothing.
+        battery_minutes=$(printf '%s\n' "$batt" | awk '/remaining/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+:[0-9][0-9]$/) { split($i, t, ":"); m=t[1]*60+t[2]; if (m > 0) printf "%d", m; exit } }')
+        case "$batt" in *"; charging"*|*"finishing charge"*) battery_charging=1 ;; esac
+        ;;
+      *) battery_present=0 ;;
+    esac
+    case "$batt" in *"'AC Power'"*) battery_ac=1 ;; esac
+  fi
 else
   cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
   cpu_pct=$(top -bn2 -d 0.2 2>/dev/null | awk '/^%Cpu/ { idle=$8 } END { if (idle == "") idle=100; printf "%.1f", 100-idle }')
@@ -170,6 +207,24 @@ else
   swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
   swap_free_kb=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
   swap_used_kb=$((swap_total_kb-swap_free_kb))
+  # No /sys/class/power_supply at all (a container, an exotic kernel) leaves
+  # battery_present empty => UNKNOWN rather than a claim about the hardware.
+  if [ -d /sys/class/power_supply ]; then
+    bat=$(find /sys/class/power_supply -maxdepth 1 -name 'BAT*' 2>/dev/null | head -n 1)
+    if [ -n "$bat" ]; then
+      battery_present=1
+      battery_pct=$(cat "$bat/capacity" 2>/dev/null || true)
+      case "$(cat "$bat/status" 2>/dev/null || true)" in Charging) battery_charging=1 ;; esac
+    else
+      battery_present=0
+    fi
+    for supply in /sys/class/power_supply/*; do
+      [ -f "$supply/type" ] || continue
+      case "$(cat "$supply/type" 2>/dev/null || true)" in
+        Mains) case "$(cat "$supply/online" 2>/dev/null || true)" in 1) battery_ac=1 ;; esac ;;
+      esac
+    done
+  fi
 fi
 disk_path=/
 if [ "$platform" = "Darwin" ] && [ -d /System/Volumes/Data ]; then
@@ -189,6 +244,15 @@ echo "pressure=$pressure"
 echo "swap_used_kb=$swap_used_kb"
 echo "disk_total_kb=$disk_total_kb"
 echo "disk_used_kb=$disk_used_kb"
+if [ -n "$battery_present" ]; then
+  echo "battery_present=$battery_present"
+  if [ "$battery_present" = 1 ]; then
+    if [ -n "$battery_pct" ]; then echo "battery_pct=$battery_pct"; fi
+    if [ -n "$battery_minutes" ]; then echo "battery_minutes=$battery_minutes"; fi
+    echo "battery_charging=$battery_charging"
+    echo "battery_ac=$battery_ac"
+  fi
+fi
 printf 'uptime=%s\n' "$(uptime 2>/dev/null || true)"
 ps -axo pid=,pcpu=,rss=,comm= 2>/dev/null | sort -k2,2nr | head -n 8 | while read -r pid cpu rss command; do
   printf 'cpu_proc=%s|%s|%s|%s\n' "$pid" "$cpu" "$rss" "$command"
@@ -265,6 +329,12 @@ export default async function plugin(bb: BbPluginApi) {
        cpu_pct REAL, pressure_level INTEGER,
        PRIMARY KEY (host_id, ts)
      )`,
+    // NULLable, and NULL means UNKNOWN — so every row written before this
+    // migration keeps parsing and reports "battery state unavailable" rather
+    // than a fabricated 0%. Stored as one JSON cell instead of six columns
+    // because nothing queries the parts, and one nullable cell has exactly the
+    // three states the reading has.
+    `ALTER TABLE samples_by_host ADD COLUMN battery TEXT`,
   ]);
 
   const config = await bb.sdk.system.config();
@@ -306,11 +376,14 @@ export default async function plugin(bb: BbPluginApi) {
   const memTotalMb = Math.round(memInfo.total / 1048576);
 
   async function takeLocalSample(): Promise<Sample> {
-    const [load, mem, fs, pressure] = await Promise.all([
+    const [load, mem, fs, pressure, battery] = await Promise.all([
       si.currentLoad(),
       si.mem(),
       si.fsSize(),
       pressureLevel(),
+      // A throw here must not lose the whole sample, and must not be read as
+      // "no battery": it is UNKNOWN.
+      si.battery().then(batteryFromSi, () => undefined),
     ]);
     const dataVol =
       fs.find((f) => f.mount === "/System/Volumes/Data") ?? fs.find((f) => f.mount === "/") ?? fs[0];
@@ -329,6 +402,7 @@ export default async function plugin(bb: BbPluginApi) {
       swapUsedMb: Math.round((mem.swapused ?? 0) / 1048576),
       diskTotalGb: dataVol ? Math.round(dataVol.size / 1073741824) : 0,
       diskUsedGb: dataVol ? Math.round(dataVol.used / 1073741824) : 0,
+      battery,
     };
   }
 
@@ -336,11 +410,12 @@ export default async function plugin(bb: BbPluginApi) {
     db.prepare(
       `INSERT OR REPLACE INTO samples_by_host
          (host_id, ts, load1, load5, cpu_count, mem_total_mb, mem_used_mb, mem_pressure,
-          swap_used_mb, disk_total_gb, disk_used_gb, cpu_pct, pressure_level)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          swap_used_mb, disk_total_gb, disk_used_gb, cpu_pct, pressure_level, battery)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       hostId, s.ts, s.load1, s.load5, s.cpuCount, s.memTotalMb, s.memUsedMb, s.memUsedFrac,
       s.swapUsedMb, s.diskTotalGb, s.diskUsedGb, s.cpuPct, s.pressureLevel,
+      encodeBattery(s.battery),
     );
     db.prepare(`DELETE FROM samples_by_host WHERE ts < ?`).run(Date.now() - RETAIN_MS);
   };
@@ -365,6 +440,9 @@ export default async function plugin(bb: BbPluginApi) {
       swapUsedMb: Number(r.swap_used_mb),
       diskTotalGb: Number(r.disk_total_gb),
       diskUsedGb: Number(r.disk_used_gb),
+      // Same shape as cpu_pct above: a missing column is a stated absence, not
+      // Number(null) === 0.
+      battery: decodeBattery(r.battery),
     };
   };
 
@@ -514,6 +592,9 @@ export default async function plugin(bb: BbPluginApi) {
         swapUsedMb: Math.round(num("swap_used_kb") / 1024),
         diskTotalGb: Math.round(num("disk_total_kb") / 1048576),
         diskUsedGb: Math.round(num("disk_used_kb") / 1048576),
+        // Deliberately NOT num(): a remote host may legitimately be a desktop,
+        // and num() would render that as 0%.
+        battery: batteryFromRemote(values),
       };
       return { sample, topCpu, topMem, uptime: values.get("uptime") ?? "" };
     } finally {
@@ -737,6 +818,16 @@ export default async function plugin(bb: BbPluginApi) {
     return "█".repeat(filled) + "░".repeat(width - filled);
   };
   const PRESSURE = { 1: "normal", 2: "warning", 4: "critical" } as Record<number, string>;
+  const batteryLine = (b: Sample["battery"]): string[] => {
+    if (b === undefined) return ["BAT   unknown — this machine did not report a battery state"];
+    if (!b.present) return [];
+    const detail = [b.charging ? "charging" : b.acConnected ? "on AC" : "on battery"];
+    if (b.minutesRemaining !== undefined) detail.push(`${b.minutesRemaining} min left`);
+    if (b.healthPct !== undefined) detail.push(`health ${b.healthPct}%`);
+    if (b.cycleCount !== undefined) detail.push(`${b.cycleCount} cycles`);
+    if (b.pct === undefined) return [`BAT   charge unknown  · ${detail.join(" · ")}`];
+    return [`BAT   ${bar(b.pct / 100)}  ${b.pct}%  · ${detail.join(" · ")}`];
+  };
 
   bb.cli.register({
     name: "system",
@@ -800,6 +891,9 @@ export default async function plugin(bb: BbPluginApi) {
             (s.swapUsedMb > 0 ? `  · swap ${(s.swapUsedMb / 1024).toFixed(1)} GB` : "") +
             `  · pressure ${PRESSURE[s.pressureLevel] ?? s.pressureLevel}`,
           `DISK  ${bar(s.diskUsedGb / (s.diskTotalGb || 1))}  ${s.diskUsedGb} / ${s.diskTotalGb} GB on the data volume`,
+          // No BAT line at all on a machine that reported no battery; the word
+          // "unknown" when it could not be read. Never a bar over an absence.
+          ...batteryLine(s.battery),
           up.trim(),
         ].join("\n"),
       };
