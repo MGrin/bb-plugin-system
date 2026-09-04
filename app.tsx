@@ -15,11 +15,15 @@ import {
 } from "./components/ui/select";
 import { Button } from "./components/ui/button";
 import type { rpcContract } from "./server";
+import type { BatteryState } from "./lib/battery";
 
 type Sample = {
   ts: number; cpuPct: number; load1: number; load5: number; cpuCount: number;
   memTotalMb: number; memUsedMb: number; memUsedFrac: number; pressureLevel: number;
   swapUsedMb: number; diskTotalGb: number; diskUsedGb: number;
+  // Optional at every layer: undefined means the sampler could not tell, which
+  // is neither "no battery" ({ present: false }) nor any number. lib/battery.ts.
+  battery?: BatteryState;
 };
 type Current = {
   sample: Sample | null;
@@ -73,6 +77,47 @@ function Tile(props: { label: string; value: string; sub: string; frac: number; 
       <div className="text-2xl font-semibold text-foreground">{props.value}</div>
       <Meter frac={props.frac} tone={tone} />
       <div className="text-xs text-muted-foreground">{props.sub}</div>
+    </div>
+  );
+}
+
+function batteryDetail(b: Extract<BatteryState, { present: true }>): string {
+  const parts = [b.charging ? "charging" : b.acConnected ? "on AC" : "on battery"];
+  if (b.minutesRemaining !== undefined) {
+    const h = Math.floor(b.minutesRemaining / 60);
+    parts.push(h > 0 ? `${h}h ${b.minutesRemaining % 60}m left` : `${b.minutesRemaining}m left`);
+  }
+  if (b.healthPct !== undefined) parts.push(`health ${b.healthPct}%`);
+  if (b.cycleCount !== undefined) parts.push(`${b.cycleCount} cycles`);
+  return parts.join(" · ");
+}
+
+// The three states render UNALIKE. A machine with no battery is not rendered by
+// this component at all (SystemDetails omits the tile); a machine whose battery
+// state could not be read says so in words. Neither ever draws a bar or a
+// number, because an absent reading shown as 0% is a laptop about to die.
+function BatteryTile({ battery }: { battery: BatteryState | undefined }) {
+  const label = <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Battery</div>;
+  if (battery === undefined) {
+    return (
+      <div className="rounded-lg border border-border bg-card p-4 space-y-2">
+        {label}
+        <div className="text-2xl font-semibold text-muted-foreground">Unknown</div>
+        <div className="text-xs text-muted-foreground">This machine did not report a battery state.</div>
+      </div>
+    );
+  }
+  if (!battery.present) return null;
+  const onBattery = !battery.charging && !battery.acConnected;
+  const tone = battery.pct === undefined ? "ok" : onBattery && battery.pct <= 20 ? "hot" : onBattery && battery.pct <= 40 ? "warn" : "ok";
+  return (
+    <div className="rounded-lg border border-border bg-card p-4 space-y-2">
+      {label}
+      <div className={`text-2xl font-semibold ${battery.pct === undefined ? "text-muted-foreground" : "text-foreground"}`}>
+        {battery.pct === undefined ? "Charge unknown" : `${battery.pct}%`}
+      </div>
+      {battery.pct === undefined ? <div className="h-1.5" /> : <Meter frac={battery.pct / 100} tone={tone} />}
+      <div className="text-xs text-muted-foreground">{batteryDetail(battery)}</div>
     </div>
   );
 }
@@ -438,9 +483,13 @@ function SystemPanel() {
 function SystemDetails({ current, samples }: { current: Current; samples: Sample[] }) {
   const s = current.sample!;
   const pressure = PRESSURE[s.pressureLevel] ?? String(s.pressureLevel);
+  // A machine that reported "no battery" gets no tile — a permanent empty
+  // battery card on a desktop is noise. UNKNOWN still gets one, so the two
+  // cases stay distinguishable on screen.
+  const showBattery = s.battery === undefined || s.battery.present;
   return (
     <>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className={`grid grid-cols-1 gap-3 ${showBattery ? "sm:grid-cols-2 lg:grid-cols-4" : "sm:grid-cols-3"}`}>
           <Tile label="CPU" value={`${Math.round(s.cpuPct)}%`} sub={`${s.cpuCount} cores · load ${s.load1.toFixed(2)}`} frac={s.cpuPct / 100} />
           <Tile
             label="Memory used"
@@ -450,6 +499,7 @@ function SystemDetails({ current, samples }: { current: Current; samples: Sample
             hot={s.pressureLevel >= 2}
           />
           <Tile label="Disk" value={`${s.diskUsedGb} GB`} sub={`of ${s.diskTotalGb} GB`} frac={s.diskUsedGb / (s.diskTotalGb || 1)} />
+          {showBattery ? <BatteryTile battery={s.battery} /> : null}
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Spark title="CPU % — last hour" points={samples.map((x) => x.cpuPct)} max={100} />
