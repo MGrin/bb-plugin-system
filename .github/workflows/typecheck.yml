@@ -11,9 +11,10 @@
 #
 # What a green run here covers: `tsc --noEmit` under `strict` with
 # `skipLibCheck: false`, over server.ts, app.tsx, components, lib, hooks and
-# types. What it does NOT cover: this repo has ZERO test files, so no line of
-# it is ever EXECUTED in CI. Green means it compiles, not that it works — a
-# weaker claim than the sibling plugins' Test job, and deliberately named so.
+# types. What it does NOT cover: whether any of it WORKS. Green means it
+# compiles — MX-835 was a type-correct `undefined` that bb's RPC serialiser
+# refused at runtime, and it passed this job. Execution lives in the sibling
+# `Test` job (.github/workflows/test.yml), which covers lib/ only.
 name: Typecheck
 
 on:

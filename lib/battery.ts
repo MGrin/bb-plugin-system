@@ -19,6 +19,19 @@
 // emitted coerces to 0, and `|| 0` collapses a genuine 0 into the same 0. A
 // battery routed through it turns a desktop into a dying laptop. Nothing here
 // uses it; absence stays `undefined` the whole way through.
+//
+// One more rule, and it is the one that took the plugin down (MX-835): an
+// optional field that has no reading is an ABSENT KEY, never a present key
+// holding `undefined`. bb's RPC serialiser refuses `undefined` — it is not a
+// JSON value — and it refuses the WHOLE call, not the field, so a Mac sitting
+// on AC power with no time estimate returned
+//   rpc current failed: $result.sample.battery.minutesRemaining is not a JSON
+//   value (undefined)
+// and the panel rendered nothing at all. The persisted path never saw it
+// because `JSON.stringify` drops such keys silently, which is exactly why the
+// bug reached a running machine: encode/decode round-trips clean, the live
+// object does not. Build the optional fields through `presentBattery` /
+// `withBattery` below rather than assigning them directly.
 import { z } from "zod";
 
 export const batteryStateShape = z.discriminatedUnion("present", [
@@ -36,6 +49,40 @@ export const batteryStateShape = z.discriminatedUnion("present", [
   }),
 ]);
 export type BatteryState = z.infer<typeof batteryStateShape>;
+export type PresentBattery = Extract<BatteryState, { present: true }>;
+
+/**
+ * The PRESENT state, carrying only the optional readings that actually have a
+ * value. A key holding `undefined` is not a JSON value and bb's RPC serialiser
+ * rejects the entire response over one — see the module header (MX-835).
+ */
+export function presentBattery(
+  base: { charging: boolean; acConnected: boolean },
+  optional: {
+    pct?: number | undefined;
+    minutesRemaining?: number | undefined;
+    cycleCount?: number | undefined;
+    healthPct?: number | undefined;
+  },
+): PresentBattery {
+  const state: PresentBattery = { present: true, ...base };
+  for (const [key, value] of Object.entries(optional)) {
+    if (value !== undefined) (state as Record<string, unknown>)[key] = value;
+  }
+  return state;
+}
+
+/**
+ * Attach a battery state to a sample, or leave the key off entirely when the
+ * state is UNKNOWN. Same rule as `presentBattery`, one level up: `battery`
+ * is optional on the sample too, so `{ battery: undefined }` fails the same way.
+ */
+export function withBattery<T extends object>(
+  base: T,
+  state: BatteryState | undefined,
+): T & { battery?: BatteryState } {
+  return state === undefined ? base : { ...base, battery: state };
+}
 
 const finite = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -67,19 +114,19 @@ export function batteryFromSi(raw: unknown): BatteryState | undefined {
   const charging = b.isCharging === true;
   const designed = finite(b.designedCapacity);
   const max = finite(b.maxCapacity);
-  return {
-    present: true,
-    pct: asPct(b.percent),
-    charging,
-    acConnected: b.acConnected === true,
-    // A "time remaining" while charging is an estimate of the wrong thing.
-    minutesRemaining: charging ? undefined : asMinutes(b.timeRemaining),
-    cycleCount: finite(b.cycleCount),
-    healthPct:
-      designed !== undefined && max !== undefined && designed > 0
-        ? Math.round((max / designed) * 100)
-        : undefined,
-  };
+  return presentBattery(
+    { charging, acConnected: b.acConnected === true },
+    {
+      pct: asPct(b.percent),
+      // A "time remaining" while charging is an estimate of the wrong thing.
+      minutesRemaining: charging ? undefined : asMinutes(b.timeRemaining),
+      cycleCount: finite(b.cycleCount),
+      healthPct:
+        designed !== undefined && max !== undefined && designed > 0
+          ? Math.round((max / designed) * 100)
+          : undefined,
+    },
+  );
 }
 
 /**
@@ -98,13 +145,13 @@ export function batteryFromRemote(values: Map<string, string>): BatteryState | u
     return Number.isFinite(n) ? n : undefined;
   };
   const charging = values.get("battery_charging") === "1";
-  return {
-    present: true,
-    pct: asPct(numeric("battery_pct")),
-    charging,
-    acConnected: values.get("battery_ac") === "1",
-    minutesRemaining: charging ? undefined : asMinutes(numeric("battery_minutes")),
-  };
+  return presentBattery(
+    { charging, acConnected: values.get("battery_ac") === "1" },
+    {
+      pct: asPct(numeric("battery_pct")),
+      minutesRemaining: charging ? undefined : asMinutes(numeric("battery_minutes")),
+    },
+  );
 }
 
 /** NULL in the column means UNKNOWN, which is what every pre-migration row is. */
