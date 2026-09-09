@@ -29,6 +29,7 @@ import {
   batteryStateShape,
   decodeBattery,
   encodeBattery,
+  withBattery,
 } from "./lib/battery";
 
 const run = promisify(execFile);
@@ -56,6 +57,10 @@ const sampleShape = z.object({
   // Optional on purpose, at every layer: absent means the sampler could not
   // tell, which is a different answer from "this machine has no battery"
   // ({ present: false }) and from any number at all. See lib/battery.ts.
+  //
+  // Optional means the KEY IS ABSENT. Every construction of a Sample goes
+  // through `withBattery`, because `{ battery: undefined }` is not JSON and
+  // bb's RPC serialiser fails the whole `current` call over it (MX-835).
   battery: batteryStateShape.optional(),
 });
 type Sample = z.infer<typeof sampleShape>;
@@ -387,7 +392,7 @@ export default async function plugin(bb: BbPluginApi) {
     ]);
     const dataVol =
       fs.find((f) => f.mount === "/System/Volumes/Data") ?? fs.find((f) => f.mount === "/") ?? fs[0];
-    return {
+    return withBattery({
       ts: Date.now(),
       cpuPct: Number(load.currentLoad.toFixed(1)),
       // si reports avgLoad PER CORE; store the raw 1-minute load so the number
@@ -402,8 +407,7 @@ export default async function plugin(bb: BbPluginApi) {
       swapUsedMb: Math.round((mem.swapused ?? 0) / 1048576),
       diskTotalGb: dataVol ? Math.round(dataVol.size / 1073741824) : 0,
       diskUsedGb: dataVol ? Math.round(dataVol.used / 1073741824) : 0,
-      battery,
-    };
+    }, battery);
   }
 
   const insert = (hostId: string, s: Sample) => {
@@ -423,7 +427,7 @@ export default async function plugin(bb: BbPluginApi) {
   const rowToSample = (r: Record<string, unknown>): Sample => {
     const count = Number(r.cpu_count) || 1;
     const load1 = Number(r.load1);
-    return {
+    return withBattery({
       ts: Number(r.ts),
       // Pre-migration rows have no cpu_pct; fall back to the old (wrong but
       // present) load-derived figure so the sparkline has no hole.
@@ -442,8 +446,7 @@ export default async function plugin(bb: BbPluginApi) {
       diskUsedGb: Number(r.disk_used_gb),
       // Same shape as cpu_pct above: a missing column is a stated absence, not
       // Number(null) === 0.
-      battery: decodeBattery(r.battery),
-    };
+    }, decodeBattery(r.battery));
   };
 
   const latest = (hostId: string): Sample | null => {
@@ -579,7 +582,7 @@ export default async function plugin(bb: BbPluginApi) {
       const num = (key: string) => Number(values.get(key)) || 0;
       const memTotalMb = Math.round(num("mem_total_kb") / 1024);
       const memUsedMb = Math.round(num("mem_used_kb") / 1024);
-      const sample: Sample = {
+      const sample: Sample = withBattery({
         ts: Date.now(),
         cpuPct: Math.min(100, Math.max(0, num("cpu_pct"))),
         load1: num("load1"),
@@ -594,8 +597,7 @@ export default async function plugin(bb: BbPluginApi) {
         diskUsedGb: Math.round(num("disk_used_kb") / 1048576),
         // Deliberately NOT num(): a remote host may legitimately be a desktop,
         // and num() would render that as 0%.
-        battery: batteryFromRemote(values),
-      };
+      }, batteryFromRemote(values));
       return { sample, topCpu, topMem, uptime: values.get("uptime") ?? "" };
     } finally {
       // Always reap the one-shot terminal — success, failure, or abort. On

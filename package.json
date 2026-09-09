@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "test": "node --test --experimental-strip-types --test-timeout=10000 lib/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

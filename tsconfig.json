@@ -18,6 +18,9 @@
       ]
     },
     "noEmit": true,
+    // The test files import siblings by their real `./x.ts` path, which is
+    // what `node --test --experimental-strip-types` resolves at runtime.
+    "allowImportingTsExtensions": true,
     "skipLibCheck": false
   },
   "include": [

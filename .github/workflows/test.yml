@@ -1,0 +1,35 @@
+# The unit gate. `node --test` over the pure modules in lib/, no framework.
+#
+# Until MX-835 this repo had NO test file, so `typecheck` was the whole story:
+# it proved the code COMPILES and never executed a line of it. That is exactly
+# how MX-835 shipped — `batteryFromSi` returned `{ minutesRemaining: undefined }`
+# on a Mac plugged into the wall, which types perfectly under a `.optional()`
+# field and which bb's RPC serialiser then refused as "not a JSON value",
+# failing the whole `current` call and blanking the panel.
+#
+# What this job covers: lib/*.test.ts, which is the pure half of the plugin
+# (battery-state mapping). What it does NOT cover: server.ts and app.tsx, whose
+# code needs a live bb host. Green here means the pure modules behave, not that
+# the plugin works.
+#
+# `--ignore-scripts` on the install: better-sqlite3 is a devDependency needed
+# only for its types, and its native rebuild is minutes of CI for nothing.
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main, main-public]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: node --test lib/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund --ignore-scripts
+      - run: npm test
