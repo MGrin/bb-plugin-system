@@ -30,6 +30,29 @@ Unlike a menu-bar monitor, this keeps **per-machine history**: a background samp
 to a 24-hour ring buffer, so you can answer "what was this machine doing twenty minutes ago,
 while that fleet was running?" — which is the question that actually comes up.
 
+## Machine controls (macOS)
+
+When the primary machine is selected, the System panel shows a **Controls** card, made
+to be used from the bb web app on a phone:
+
+- **Volume**: a slider and a mute button.
+- **Brightness**: a slider for the built-in display. macOS has no command for this on
+  Apple Silicon, so the plugin builds `lib/brightness.swift` once with the system `swiftc`
+  into `~/Library/Caches/bb-plugin-system/`. Without the Command Line Tools it reads
+  "unavailable".
+- **Amphetamine**: keep-awake on or off, shown only when `/Applications/Amphetamine.app`
+  exists. "On" starts a session with Amphetamine's own default options.
+- **Power**: Lock screen, Sleep, Restart and Shut down. Each asks for confirmation
+  first, then runs 1.5 s after the reply, so the phone hears back before the Mac goes.
+
+**One-time permissions.** The first Amphetamine call, and the first Restart or Shut
+down, make macOS ask on the Mac itself whether bb may control Amphetamine or System
+Events. Until someone clicks Allow there, those controls report that they did not
+answer. Change it later in System Settings → Privacy & Security → Automation.
+
+**After a restart or shutdown**, bb is reachable again only once the Mac is back at the
+desktop. With FileVault on, that means someone types the password at the Mac.
+
 ## How it measures
 
 Metrics on the primary machine come from

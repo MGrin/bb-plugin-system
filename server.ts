@@ -19,6 +19,10 @@
 // shells the same `ps` with nine more columns and takes its decayed pcpu verbatim,
 // so there is nothing to gain and a 22ms spawn to lose.
 import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import si from "systeminformation";
@@ -31,6 +35,18 @@ import {
   encodeBattery,
   withBattery,
 } from "./lib/battery";
+import {
+  AMPHETAMINE_APP,
+  controlsStateShape,
+  powerActionShape,
+  readControls,
+  schedulePower,
+  setAmphetamine,
+  setBrightness,
+  setMuted,
+  setVolume,
+  type Exec,
+} from "./lib/controls";
 
 const run = promisify(execFile);
 const ACTIVE_MS = 15_000; // a thread is running a turn, or the panel is open
@@ -40,6 +56,8 @@ const PRIMARY_FALLBACK_ID = "__primary__";
 // End-to-end budget: terminal creation, the sampler script (~5 s on macOS,
 // most of it the two top samples), and draining the transcript.
 const REMOTE_COMMAND_TIMEOUT_MS = 20_000;
+// Long enough for the RPC reply to reach a phone before the machine sleeps or stops.
+const POWER_DELAY_MS = 1_500;
 
 const sampleShape = z.object({
   ts: z.number(),
@@ -112,6 +130,17 @@ export const rpcContract = defineRpcContract({
   setHomeVisibility: {
     input: z.object({ showOnHomepage: z.boolean() }).strict(),
     output: z.object({ ok: z.boolean() }),
+  },
+  // Machine controls (lib/controls.ts). They act on THIS machine — the one bb's
+  // server runs on — and the panel shows them only when that machine is selected.
+  controls: { input: z.null(), output: controlsStateShape },
+  setVolume: { input: z.object({ level: z.number().min(0).max(100) }).strict(), output: controlsStateShape },
+  setMuted: { input: z.object({ muted: z.boolean() }).strict(), output: controlsStateShape },
+  setBrightness: { input: z.object({ level: z.number().min(0).max(1) }).strict(), output: controlsStateShape },
+  setAmphetamine: { input: z.object({ active: z.boolean() }).strict(), output: controlsStateShape },
+  power: {
+    input: z.object({ action: powerActionShape }).strict(),
+    output: z.object({ action: powerActionShape, inMs: z.number() }),
   },
 });
 
@@ -310,6 +339,46 @@ const BUILD_STAMP: { rev: string | null; dirty: boolean | null; sourceDir: strin
     return { rev: null, dirty: null, sourceDir, loadedAt, why: e instanceof Error ? e.message : String(e) };
   }
 })();
+
+/** execFile to stdout, bounded. The adapter lib/controls.ts is written against. */
+const execOut: Exec = async (file, args, timeoutMs) => (await run(file, args, { timeout: timeoutMs })).stdout;
+
+/**
+ * Builds lib/brightness.swift once, with the system swiftc, into the user's cache, under a
+ * name carrying the source's hash — so an edited helper is rebuilt and a stale one is never
+ * run. Resolves to null when it cannot be built (no Command Line Tools, not macOS); the
+ * panel then says brightness is unavailable instead of guessing. The source is looked up
+ * beside this file and one level up, because the bundle may run from dist/.
+ */
+let brightnessHelper: Promise<string | null> | null = null;
+function ensureBrightnessHelper(log: BbPluginApi["log"]): Promise<string | null> {
+  brightnessHelper ??= (async () => {
+    if (process.platform !== "darwin") return null;
+    const source = [join(import.meta.dirname, "lib", "brightness.swift"), join(import.meta.dirname, "..", "lib", "brightness.swift")]
+      .find((p) => existsSync(p));
+    if (!source) {
+      log.warn("brightness: lib/brightness.swift not found beside the bundle");
+      return null;
+    }
+    const hash = createHash("sha256").update(readFileSync(source)).digest("hex").slice(0, 12);
+    const dir = join(homedir(), "Library", "Caches", "bb-plugin-system");
+    const target = join(dir, `brightness-${hash}`);
+    if (existsSync(target)) return target;
+    try {
+      mkdirSync(dir, { recursive: true });
+      const tmp = `${target}.${process.pid}.tmp`;
+      await run("/usr/bin/swiftc", ["-O", source, "-o", tmp], { timeout: 180_000 });
+      renameSync(tmp, target); // atomic: a half-written binary is never run
+      log.info(`brightness: built ${target}`);
+      return target;
+    } catch (e) {
+      log.warn(`brightness: could not build the helper: ${e instanceof Error ? e.message : e}`);
+      brightnessHelper = null; // allow a later retry, e.g. after the CLT are installed
+      return null;
+    }
+  })();
+  return brightnessHelper;
+}
 
 export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
@@ -812,7 +881,42 @@ export default async function plugin(bb: BbPluginApi) {
       bb.realtime.publish("system.home-visibility", { showOnHomepage: input.showOnHomepage });
       return { ok: true };
     },
+    controls: () => currentControls(),
+    async setVolume({ level }) {
+      await setVolume(execOut, level);
+      return currentControls();
+    },
+    async setMuted({ muted }) {
+      await setMuted(execOut, muted);
+      return currentControls();
+    },
+    async setBrightness({ level }) {
+      const helper = await ensureBrightnessHelper(bb.log);
+      if (!helper) throw new Error("brightness is unavailable: the helper could not be built on this Mac");
+      await setBrightness(execOut, helper, level);
+      return currentControls();
+    },
+    async setAmphetamine({ active }) {
+      await setAmphetamine(execOut, active);
+      return currentControls();
+    },
+    power({ action }) {
+      // Logged before it runs: after a shutdown this line is the only record of who asked.
+      bb.log.info(`power: ${action} requested from the System page`);
+      const inMs = schedulePower(action, execOut, POWER_DELAY_MS, (message) => {
+        bb.log.warn(`power: ${action} failed: ${message}`);
+        bb.realtime.publish("system.control-error", { action, message });
+      });
+      return { action, inMs };
+    },
   });
+
+  async function currentControls() {
+    return readControls(execOut, {
+      amphetamineInstalled: existsSync(AMPHETAMINE_APP),
+      brightnessHelper: await ensureBrightnessHelper(bb.log),
+    });
+  }
 
   const pct = (n: number) => `${Math.round(n * 100)}%`;
   const bar = (frac: number, width = 20) => {
