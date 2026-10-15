@@ -450,6 +450,8 @@ type Controls = {
   amphetamine: { installed: boolean; active: boolean | null; error: string | null };
 };
 type PowerAction = "sleep" | "lock" | "restart" | "shutdown";
+/** Amphetamine before its first (possibly slow) read has answered. */
+const CHECKING: Controls["amphetamine"] = { installed: true, active: null, error: null };
 
 const POWER: { action: PowerAction; label: string; question: string; detail: string; danger: boolean }[] = [
   { action: "lock", label: "Lock screen", question: "Lock the screen?", detail: "The screen turns off and the Mac asks for its password. Agents keep running and bb stays reachable.", danger: false },
@@ -462,20 +464,38 @@ function useControls() {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<Controls | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const load = useCallback(async () => {
+  // Two reads, apart: the levels answer in ~0.1 s, while Amphetamine can hang for
+  // its whole timeout on a pending macOS permission prompt. The keys never wait on it.
+  const loadLevels = useCallback(async () => {
     try {
-      setState((await rpc.call("controls", null)) as Controls);
+      const levels = await rpc.call("levels", null);
+      setState((prev) => ({ amphetamine: prev?.amphetamine ?? CHECKING, ...levels }));
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Unable to read the controls");
     }
   }, [rpc]);
+  const loadAmphetamine = useCallback(async () => {
+    try {
+      const amphetamine = await rpc.call("amphetamine", null);
+      setState((prev) => (prev ? { ...prev, amphetamine } : prev));
+    } catch {
+      // Shown as "checking" until the next read; the levels carry the page meanwhile.
+    }
+  }, [rpc]);
+  const load = useCallback(async () => {
+    await Promise.all([loadLevels(), loadAmphetamine()]);
+  }, [loadAmphetamine, loadLevels]);
   useEffect(() => {
-    void load();
+    void loadLevels().then(() => loadAmphetamine());
     // The keyboard and the menu bar change these too; keep the page current.
-    const timer = setInterval(() => void load(), 15_000);
-    return () => clearInterval(timer);
-  }, [load]);
+    const levelsTimer = setInterval(() => void loadLevels(), 15_000);
+    const amphetamineTimer = setInterval(() => void loadAmphetamine(), 60_000);
+    return () => {
+      clearInterval(levelsTimer);
+      clearInterval(amphetamineTimer);
+    };
+  }, [loadAmphetamine, loadLevels]);
   const act = useCallback(
     async (call: () => Promise<unknown>) => {
       try {
@@ -614,14 +634,18 @@ function ControlsCard() {
             <div className="flex items-center gap-3 text-sm">
               <span className="w-24 shrink-0 text-muted-foreground">Amphetamine</span>
               {state.amphetamine.active === null ? (
-                <span className="text-xs text-destructive">{state.amphetamine.error ?? "state unknown"}</span>
+                state.amphetamine.error ? (
+                  <span className="text-xs text-destructive">{state.amphetamine.error}</span>
+                ) : (
+                  <span className="text-xs text-muted-foreground">Checking…</span>
+                )
               ) : (
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
                   aria-pressed={state.amphetamine.active}
-                  onClick={() => void act(() => rpc.call("setAmphetamine", { active: !state.amphetamine.active }))}
+                  onClick={() => void act(async () => ({ amphetamine: await rpc.call("setAmphetamine", { active: !state.amphetamine.active }) }))}
                 >
                   Keep awake: {state.amphetamine.active ? "On" : "Off"}
                 </Button>

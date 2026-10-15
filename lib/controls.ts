@@ -233,21 +233,29 @@ export async function readLevels(exec: Exec, brightnessHelper: string | null): P
   return { volume: volume.v, volumeError: volume.err, brightness: brightness.v, brightnessError: brightness.err };
 }
 
+export const amphetamineShape = controlsStateShape.shape.amphetamine;
+export type AmphetamineState = z.infer<typeof amphetamineShape>;
+
+/** Read on its own because it can be SLOW: while macOS holds the Automation prompt it
+ *  hangs its whole timeout, and nothing else on the page may wait on it. */
+export async function readAmphetamine(exec: Exec, installed: boolean): Promise<AmphetamineState> {
+  if (!installed) return { installed: false, active: null, error: null };
+  return exec(OSASCRIPT, ["-e", amphetamineReadScript()], READ_TIMEOUT_MS).then(
+    (out) => {
+      const active = parseAmphetamine(out);
+      return { installed: true, active, error: active === null ? `unexpected answer: ${out.trim().slice(0, 80)}` : null };
+    },
+    (e) => ({ installed: true, active: null, error: explain(e, "Amphetamine") }),
+  );
+}
+
 export async function readControls(
   exec: Exec,
   deps: { amphetamineInstalled: boolean; brightnessHelper: string | null },
 ): Promise<ControlsState> {
   const [levels, amphetamine] = await Promise.all([
     readLevels(exec, deps.brightnessHelper),
-    !deps.amphetamineInstalled
-      ? Promise.resolve({ installed: false, active: null, error: null })
-      : exec(OSASCRIPT, ["-e", amphetamineReadScript()], READ_TIMEOUT_MS).then(
-          (out) => {
-            const active = parseAmphetamine(out);
-            return { installed: true, active, error: active === null ? `unexpected answer: ${out.trim().slice(0, 80)}` : null };
-          },
-          (e) => ({ installed: true, active: null, error: explain(e, "Amphetamine") }),
-        ),
+    readAmphetamine(exec, deps.amphetamineInstalled),
   ]);
   return { ...levels, amphetamine };
 }
