@@ -37,9 +37,11 @@ import {
 } from "./lib/battery";
 import {
   AMPHETAMINE_APP,
+  amphetamineShape,
   controlsStateShape,
   levelsShape,
   powerActionShape,
+  readAmphetamine,
   readControls,
   readLevels,
   schedulePower,
@@ -138,13 +140,17 @@ export const rpcContract = defineRpcContract({
   // Machine controls (lib/controls.ts). They act on THIS machine — the one bb's
   // server runs on — and the panel shows them only when that machine is selected.
   controls: { input: z.null(), output: controlsStateShape },
+  // The page reads these two apart: levels answer in ~0.1 s, while Amphetamine can hang
+  // its whole timeout on a pending Automation prompt, and the keys must not wait on it.
+  levels: { input: z.null(), output: levelsShape },
+  amphetamine: { input: z.null(), output: amphetamineShape },
   // One key press: volume or brightness, one sixteenth up or down, as the Mac's keys do.
   nudge: {
     input: z.object({ target: z.enum(["volume", "brightness"]), direction: z.union([z.literal(1), z.literal(-1)]) }).strict(),
     output: levelsShape,
   },
   setMuted: { input: z.object({ muted: z.boolean() }).strict(), output: levelsShape },
-  setAmphetamine: { input: z.object({ active: z.boolean() }).strict(), output: controlsStateShape },
+  setAmphetamine: { input: z.object({ active: z.boolean() }).strict(), output: amphetamineShape },
   power: {
     input: z.object({ action: powerActionShape }).strict(),
     output: z.object({ action: powerActionShape, inMs: z.number() }),
@@ -889,6 +895,8 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true };
     },
     controls: () => currentControls(),
+    levels: async () => readLevels(execOut, await ensureBrightnessHelper(bb.log)),
+    amphetamine: () => readAmphetamine(execOut, existsSync(AMPHETAMINE_APP)),
     // One press at a time: each reads the level the previous one left, so three fast
     // taps move three steps instead of three reads of the same starting level.
     nudge: ({ target, direction }) =>
@@ -911,7 +919,7 @@ export default async function plugin(bb: BbPluginApi) {
       }),
     async setAmphetamine({ active }) {
       await setAmphetamine(execOut, active);
-      return currentControls();
+      return readAmphetamine(execOut, existsSync(AMPHETAMINE_APP));
     },
     power({ action }) {
       // Logged before it runs: after a shutdown this line is the only record of who asked.
