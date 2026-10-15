@@ -11,7 +11,7 @@ against a wrong one that looked right.
 
 ```sh
 npm install          # rc=0
-npm test             # node --test over lib/*.test.ts — 26 tests, 0 fail (2026-10-15)
+npm test             # node --test over lib/*.test.ts — 30 tests, 0 fail (2026-10-15)
 npm run typecheck    # tsc --noEmit, rc=0
 bb plugin build .    # dist/{server,app}.js + .meta.json + app.css
 ```

@@ -35,8 +35,10 @@ while that fleet was running?" — which is the question that actually comes up.
 When the primary machine is selected, the System panel shows a **Controls** card, made
 to be used from the bb web app on a phone:
 
-- **Volume**: a slider and a mute button.
-- **Brightness**: a slider for the built-in display. macOS has no command for this on
+- **Brightness and volume keys**, styled like a MacBook's top row: brightness down/up,
+  mute, volume down/up. Each press moves one sixteenth, as the Mac's own keys do, and
+  presses run one at a time on the server, so fast taps are not lost.
+- **Brightness** is the built-in display. macOS has no command for this on
   Apple Silicon, so the plugin builds `lib/brightness.swift` once with the system `swiftc`
   into `~/Library/Caches/bb-plugin-system/`. Without the Command Line Tools it reads
   "unavailable".

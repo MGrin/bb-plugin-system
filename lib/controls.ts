@@ -184,13 +184,35 @@ export function schedulePower(
   return delayMs;
 }
 
-// ── reading everything ────────────────────────────────────────────────────────
+// ── one key press ─────────────────────────────────────────────────────────────
 
-export async function readControls(
-  exec: Exec,
-  deps: { amphetamineInstalled: boolean; brightnessHelper: string | null },
-): Promise<ControlsState> {
-  const [volume, brightness, amphetamine] = await Promise.all([
+/** The Mac's own volume and brightness keys move in sixteenths. */
+export const KEY_STEPS = 16;
+
+/**
+ * The next sixteenth of `max` from `value`, in `direction`. An off-grid value goes to
+ * the nearest grid point that way, not one full step past it. `tolerance` absorbs the
+ * rounding of a stored value: volume is kept as an integer, so 13/16 = 81.25 reads back
+ * as 81, and without it "up from 81" would land on 81.25 again and the key would stick.
+ */
+function stepLevel(value: number, max: number, direction: 1 | -1, tolerance: number): number {
+  const grid = max / KEY_STEPS;
+  const k = direction > 0 ? Math.floor((value + tolerance) / grid) + 1 : Math.ceil((value - tolerance) / grid) - 1;
+  return Math.min(KEY_STEPS, Math.max(0, k)) * grid;
+}
+
+export const stepVolume = (level: number, direction: 1 | -1): number => Math.round(stepLevel(level, 100, direction, 0.5));
+export const stepBrightness = (frac: number, direction: 1 | -1): number => stepLevel(frac, 1, direction, 1e-4);
+
+// ── reading ───────────────────────────────────────────────────────────────────
+
+export const levelsShape = controlsStateShape.pick({ volume: true, volumeError: true, brightness: true, brightnessError: true });
+export type Levels = z.infer<typeof levelsShape>;
+
+/** Volume and brightness only: what a key press changes, and fast. It never asks
+ *  Amphetamine, whose read can hang its whole timeout on a pending Automation prompt. */
+export async function readLevels(exec: Exec, brightnessHelper: string | null): Promise<Levels> {
+  const [volume, brightness] = await Promise.all([
     exec(OSASCRIPT, ["-e", "get volume settings"], READ_TIMEOUT_MS).then(
       (out) => {
         const v = parseVolume(out);
@@ -198,15 +220,25 @@ export async function readControls(
       },
       (e) => ({ v: null, err: explain(e, "the volume") }),
     ),
-    deps.brightnessHelper === null
+    brightnessHelper === null
       ? Promise.resolve({ v: null, err: "the brightness helper could not be built on this Mac" })
-      : exec(deps.brightnessHelper, ["get"], READ_TIMEOUT_MS).then(
+      : exec(brightnessHelper, ["get"], READ_TIMEOUT_MS).then(
           (out) => {
             const v = parseBrightness(out);
             return v === null ? { v: null, err: "the built-in display is off or absent" } : { v, err: null };
           },
           (e) => ({ v: null, err: explain(e, "the display") }),
         ),
+  ]);
+  return { volume: volume.v, volumeError: volume.err, brightness: brightness.v, brightnessError: brightness.err };
+}
+
+export async function readControls(
+  exec: Exec,
+  deps: { amphetamineInstalled: boolean; brightnessHelper: string | null },
+): Promise<ControlsState> {
+  const [levels, amphetamine] = await Promise.all([
+    readLevels(exec, deps.brightnessHelper),
     !deps.amphetamineInstalled
       ? Promise.resolve({ installed: false, active: null, error: null })
       : exec(OSASCRIPT, ["-e", amphetamineReadScript()], READ_TIMEOUT_MS).then(
@@ -217,11 +249,5 @@ export async function readControls(
           (e) => ({ installed: true, active: null, error: explain(e, "Amphetamine") }),
         ),
   ]);
-  return {
-    volume: volume.v,
-    volumeError: volume.err,
-    brightness: brightness.v,
-    brightnessError: brightness.err,
-    amphetamine,
-  };
+  return { ...levels, amphetamine };
 }

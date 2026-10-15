@@ -17,7 +17,10 @@ import {
   parseVolume,
   powerCommand,
   readControls,
+  readLevels,
   schedulePower,
+  stepBrightness,
+  stepVolume,
   volumeScript,
   mutedScript,
   type Exec,
@@ -55,6 +58,41 @@ test("a volume is clamped to an integer 0..100 before it reaches a command", () 
   assert.equal(volumeScript(43), "set volume output volume 43");
   assert.equal(mutedScript(true), "set volume output muted true");
   assert.equal(mutedScript(false), "set volume output muted false");
+});
+
+test("a key press moves volume one sixteenth, to the next grid point that way", () => {
+  // The Mac's own keys step in sixteenths: 100/16 = 6.25 per press.
+  assert.equal(stepVolume(75, 1), 81);
+  assert.equal(stepVolume(75, -1), 69);
+  assert.equal(stepVolume(0, -1), 0);
+  assert.equal(stepVolume(100, 1), 100);
+  assert.equal(stepVolume(98, 1), 100);
+  assert.equal(stepVolume(3, -1), 0);
+});
+
+test("volume never sticks: 81 is 13/16 rounded, and the next press still moves", () => {
+  // 13/16 is 81.25, stored as the integer 81 — which sits just BELOW the grid point.
+  // Without a tolerance, "up from 81" lands on 81.25 again and the key does nothing.
+  assert.equal(stepVolume(81, 1), 88);
+  assert.equal(stepVolume(81, -1), 75);
+  let v = 0;
+  for (let i = 0; i < 16; i++) {
+    const next = stepVolume(v, 1);
+    assert.ok(next > v, `press ${i + 1} from ${v} did not move`);
+    v = next;
+  }
+  assert.equal(v, 100, "sixteen presses from silent reach full volume");
+  for (let i = 0; i < 16; i++) v = stepVolume(v, -1);
+  assert.equal(v, 0, "and sixteen back reach silent");
+});
+
+test("a key press moves brightness one sixteenth, snapping an off-grid level", () => {
+  // 0.6019 is what this Mac read on 2026-10-15: between 9/16 and 10/16.
+  assert.equal(stepBrightness(0.60192436, 1), 10 / 16);
+  assert.equal(stepBrightness(0.60192436, -1), 9 / 16);
+  assert.equal(stepBrightness(10 / 16, 1), 11 / 16);
+  assert.equal(stepBrightness(1, 1), 1);
+  assert.equal(stepBrightness(0, -1), 0);
 });
 
 test("brightness is a fraction 0..1; anything else is unreadable", () => {
@@ -166,4 +204,21 @@ test("readControls: no Amphetamine and no brightness helper are stated, not gues
   assert.equal(state.brightness, null);
   assert.match(state.brightnessError ?? "", /helper/);
   assertJsonValue(state);
+});
+
+test("readLevels reads volume and brightness only, never Amphetamine", async () => {
+  // A key press returns levels, not the full state: while macOS holds the
+  // Automation prompt, the Amphetamine read hangs for its whole timeout, and a
+  // volume key must not wait 8 s on it.
+  const asked: string[] = [];
+  const exec: Exec = async (file, args) => {
+    asked.push([file, ...args].join(" "));
+    if (args.join(" ").includes("get volume settings")) return LIVE_VOLUME;
+    if (file === "/fake/brightness") return "0.5\n";
+    throw new Error(`unexpected ${file}`);
+  };
+  const levels = await readLevels(exec, "/fake/brightness");
+  assert.deepEqual(levels, { volume: { level: 75, muted: false }, volumeError: null, brightness: 0.5, brightnessError: null });
+  assert.ok(!asked.some((a) => a.includes("Amphetamine")), asked.join(" | "));
+  assertJsonValue(levels);
 });
