@@ -38,13 +38,17 @@ import {
 import {
   AMPHETAMINE_APP,
   controlsStateShape,
+  levelsShape,
   powerActionShape,
   readControls,
+  readLevels,
   schedulePower,
   setAmphetamine,
   setBrightness,
   setMuted,
   setVolume,
+  stepBrightness,
+  stepVolume,
   type Exec,
 } from "./lib/controls";
 
@@ -134,9 +138,12 @@ export const rpcContract = defineRpcContract({
   // Machine controls (lib/controls.ts). They act on THIS machine — the one bb's
   // server runs on — and the panel shows them only when that machine is selected.
   controls: { input: z.null(), output: controlsStateShape },
-  setVolume: { input: z.object({ level: z.number().min(0).max(100) }).strict(), output: controlsStateShape },
-  setMuted: { input: z.object({ muted: z.boolean() }).strict(), output: controlsStateShape },
-  setBrightness: { input: z.object({ level: z.number().min(0).max(1) }).strict(), output: controlsStateShape },
+  // One key press: volume or brightness, one sixteenth up or down, as the Mac's keys do.
+  nudge: {
+    input: z.object({ target: z.enum(["volume", "brightness"]), direction: z.union([z.literal(1), z.literal(-1)]) }).strict(),
+    output: levelsShape,
+  },
+  setMuted: { input: z.object({ muted: z.boolean() }).strict(), output: levelsShape },
   setAmphetamine: { input: z.object({ active: z.boolean() }).strict(), output: controlsStateShape },
   power: {
     input: z.object({ action: powerActionShape }).strict(),
@@ -882,20 +889,26 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true };
     },
     controls: () => currentControls(),
-    async setVolume({ level }) {
-      await setVolume(execOut, level);
-      return currentControls();
-    },
-    async setMuted({ muted }) {
-      await setMuted(execOut, muted);
-      return currentControls();
-    },
-    async setBrightness({ level }) {
-      const helper = await ensureBrightnessHelper(bb.log);
-      if (!helper) throw new Error("brightness is unavailable: the helper could not be built on this Mac");
-      await setBrightness(execOut, helper, level);
-      return currentControls();
-    },
+    // One press at a time: each reads the level the previous one left, so three fast
+    // taps move three steps instead of three reads of the same starting level.
+    nudge: ({ target, direction }) =>
+      serially(async () => {
+        const helper = await ensureBrightnessHelper(bb.log);
+        const now = await readLevels(execOut, helper);
+        if (target === "volume") {
+          if (!now.volume) throw new Error(`volume is unavailable: ${now.volumeError}`);
+          await setVolume(execOut, stepVolume(now.volume.level, direction));
+        } else {
+          if (!helper || now.brightness === null) throw new Error(`brightness is unavailable: ${now.brightnessError}`);
+          await setBrightness(execOut, helper, stepBrightness(now.brightness, direction));
+        }
+        return readLevels(execOut, helper);
+      }),
+    setMuted: ({ muted }) =>
+      serially(async () => {
+        await setMuted(execOut, muted);
+        return readLevels(execOut, await ensureBrightnessHelper(bb.log));
+      }),
     async setAmphetamine({ active }) {
       await setAmphetamine(execOut, active);
       return currentControls();
@@ -910,6 +923,13 @@ export default async function plugin(bb: BbPluginApi) {
       return { action, inMs };
     },
   });
+
+  let queue: Promise<unknown> = Promise.resolve();
+  function serially<T>(task: () => Promise<T>): Promise<T> {
+    const run = queue.then(task, task);
+    queue = run.catch(() => undefined);
+    return run;
+  }
 
   async function currentControls() {
     return readControls(execOut, {

@@ -14,6 +14,8 @@ import {
   SelectValue,
 } from "./components/ui/select";
 import { Button } from "./components/ui/button";
+import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react";
+import { Sun03Icon, VolumeHighIcon, VolumeLowIcon, VolumeMute02Icon } from "@hugeicons/core-free-icons";
 import type { rpcContract } from "./server";
 import type { BatteryState } from "./lib/battery";
 
@@ -477,7 +479,9 @@ function useControls() {
   const act = useCallback(
     async (call: () => Promise<unknown>) => {
       try {
-        setState((await call()) as Controls);
+        // A key press returns only the levels; merge, so Amphetamine's state stays.
+        const next = (await call()) as Partial<Controls>;
+        setState((prev) => (prev ? { ...prev, ...next } : prev));
         setError(null);
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "The change failed");
@@ -489,45 +493,41 @@ function useControls() {
   return { state, error, rpc, act };
 }
 
-/** A 0..100 slider that commits 250 ms after the finger stops, not on every pixel. */
-function LevelSlider(props: { label: string; value: number; onCommit: (value: number) => void }) {
-  const [local, setLocal] = useState(props.value);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (!timer.current) setLocal(props.value);
-  }, [props.value]);
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+/**
+ * One key of a MacBook's top row: a dark, softly rounded cap with the symbol in the
+ * middle, which dips when pressed. Each press is one step, as on the Mac itself.
+ */
+function Key(props: { label: string; icon: IconSvgElement; iconSize?: number; pressed?: boolean; disabled?: boolean; onPress: () => void }) {
   return (
-    <label className="flex flex-1 items-center gap-3 text-sm">
-      <span className="w-24 shrink-0 text-muted-foreground">{props.label}</span>
-      <input
-        type="range"
-        min={0}
-        max={100}
-        step={1}
-        value={local}
-        aria-label={props.label}
-        className="h-8 min-w-0 flex-1 accent-primary"
-        onChange={(event) => {
-          const value = Number(event.currentTarget.value);
-          setLocal(value);
-          if (timer.current) clearTimeout(timer.current);
-          timer.current = setTimeout(() => {
-            timer.current = null;
-            props.onCommit(value);
-          }, 250);
-        }}
-      />
-      <span className="w-10 text-right tabular-nums">{local}%</span>
-    </label>
+    <button
+      type="button"
+      aria-label={props.label}
+      title={props.label}
+      aria-pressed={props.pressed}
+      disabled={props.disabled}
+      onClick={props.onPress}
+      className={[
+        "flex h-12 w-16 select-none touch-manipulation items-center justify-center rounded-[7px]",
+        "border border-black/70 bg-gradient-to-b from-neutral-800 to-neutral-900 text-neutral-200",
+        "shadow-[inset_0_1px_0_rgba(255,255,255,0.09),0_1px_2px_rgba(0,0,0,0.55)]",
+        "transition-[transform,box-shadow,background-color] duration-75",
+        "active:translate-y-px active:from-neutral-900 active:to-neutral-950 active:shadow-[inset_0_1px_3px_rgba(0,0,0,0.7)]",
+        "disabled:opacity-40 aria-pressed:text-amber-300",
+      ].join(" ")}
+    >
+      <HugeiconsIcon icon={props.icon} size={props.iconSize ?? 20} strokeWidth={1.7} />
+    </button>
   );
 }
 
-function Unavailable({ label, why }: { label: string; why: string | null }) {
+function KeyGroup(props: { title: string; reading: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-3 text-sm">
-      <span className="w-24 shrink-0 text-muted-foreground">{label}</span>
-      <span className="text-xs text-muted-foreground">Unavailable{why ? `: ${why}` : ""}</span>
+    <div className="space-y-1.5">
+      <div className="flex items-baseline justify-between gap-2 text-xs text-muted-foreground">
+        <span className="font-medium uppercase tracking-wide">{props.title}</span>
+        <span className="tabular-nums">{props.reading}</span>
+      </div>
+      <div className="flex gap-1.5">{props.children}</div>
     </div>
   );
 }
@@ -559,35 +559,57 @@ function ControlsCard() {
         <div className="text-sm text-muted-foreground">Reading the controls…</div>
       ) : (
         <>
-          {state.volume ? (
-            <div className="flex items-center gap-2">
-              <LevelSlider
-                label="Volume"
-                value={state.volume.level}
-                onCommit={(level) => void act(() => rpc.call("setVolume", { level }))}
+          <div className="flex flex-wrap gap-x-6 gap-y-3">
+            <KeyGroup
+              title="Brightness"
+              reading={state.brightness !== null ? `${Math.round(state.brightness * 100)}%` : "unavailable"}
+            >
+              <Key
+                label="Brightness down"
+                icon={Sun03Icon}
+                iconSize={15}
+                disabled={state.brightness === null}
+                onPress={() => void act(() => rpc.call("nudge", { target: "brightness", direction: -1 }))}
               />
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                aria-pressed={state.volume.muted}
-                onClick={() => void act(() => rpc.call("setMuted", { muted: !state.volume!.muted }))}
-              >
-                {state.volume.muted ? "Unmute" : "Mute"}
-              </Button>
-            </div>
-          ) : (
-            <Unavailable label="Volume" why={state.volumeError} />
-          )}
-          {state.brightness !== null ? (
-            <LevelSlider
-              label="Brightness"
-              value={Math.round(state.brightness * 100)}
-              onCommit={(value) => void act(() => rpc.call("setBrightness", { level: value / 100 }))}
-            />
-          ) : (
-            <Unavailable label="Brightness" why={state.brightnessError} />
-          )}
+              <Key
+                label="Brightness up"
+                icon={Sun03Icon}
+                iconSize={23}
+                disabled={state.brightness === null}
+                onPress={() => void act(() => rpc.call("nudge", { target: "brightness", direction: 1 }))}
+              />
+            </KeyGroup>
+            <KeyGroup
+              title="Volume"
+              reading={state.volume ? (state.volume.muted ? `muted · ${state.volume.level}%` : `${state.volume.level}%`) : "unavailable"}
+            >
+              <Key
+                label={state.volume?.muted ? "Unmute" : "Mute"}
+                icon={VolumeMute02Icon}
+                pressed={state.volume?.muted ?? false}
+                disabled={!state.volume}
+                onPress={() => void act(() => rpc.call("setMuted", { muted: !state.volume!.muted }))}
+              />
+              <Key
+                label="Volume down"
+                icon={VolumeLowIcon}
+                disabled={!state.volume}
+                onPress={() => void act(() => rpc.call("nudge", { target: "volume", direction: -1 }))}
+              />
+              <Key
+                label="Volume up"
+                icon={VolumeHighIcon}
+                disabled={!state.volume}
+                onPress={() => void act(() => rpc.call("nudge", { target: "volume", direction: 1 }))}
+              />
+            </KeyGroup>
+          </div>
+          {state.brightness === null && state.brightnessError ? (
+            <div className="text-xs text-muted-foreground">Brightness: {state.brightnessError}</div>
+          ) : null}
+          {!state.volume && state.volumeError ? (
+            <div className="text-xs text-muted-foreground">Volume: {state.volumeError}</div>
+          ) : null}
           {state.amphetamine.installed ? (
             <div className="flex items-center gap-3 text-sm">
               <span className="w-24 shrink-0 text-muted-foreground">Amphetamine</span>
