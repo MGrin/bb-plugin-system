@@ -12,7 +12,7 @@
   },
   "bb": {
     "name": "System",
-    "description": "Live system overview: CPU load, memory pressure, disk usage, top processes — panel, homepage tiles, and bb system CLI.",
+    "description": "Live system overview (CPU load, memory pressure, disk usage, top processes) and machine controls (volume, brightness, Amphetamine, power) \u2014 panel, homepage tiles, and bb system CLI.",
     "branding": {
       "icon": "Activity"
     },

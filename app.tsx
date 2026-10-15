@@ -435,6 +435,214 @@ function ShowOnHomeToggle() {
   );
 }
 
+// ── Machine controls (lib/controls.ts) ────────────────────────────────────────
+// They act on the machine bb's server runs on, so the panel shows them only while
+// that machine is selected. Every power action asks first, in place, because a
+// mis-tap on a phone is the likeliest way to press one.
+
+type Controls = {
+  volume: { level: number; muted: boolean } | null;
+  volumeError: string | null;
+  brightness: number | null;
+  brightnessError: string | null;
+  amphetamine: { installed: boolean; active: boolean | null; error: string | null };
+};
+type PowerAction = "sleep" | "lock" | "restart" | "shutdown";
+
+const POWER: { action: PowerAction; label: string; question: string; detail: string; danger: boolean }[] = [
+  { action: "lock", label: "Lock screen", question: "Lock the screen?", detail: "The screen turns off and the Mac asks for its password. Agents keep running and bb stays reachable.", danger: false },
+  { action: "sleep", label: "Sleep", question: "Put the Mac to sleep?", detail: "Agents pause, and bb is unreachable until the Mac wakes.", danger: false },
+  { action: "restart", label: "Restart", question: "Restart the Mac?", detail: "Running agents stop. With FileVault on, bb stays unreachable until someone unlocks the Mac in person.", danger: true },
+  { action: "shutdown", label: "Shut down", question: "Shut down the Mac?", detail: "Nothing comes back until someone presses the power button.", danger: true },
+];
+
+function useControls() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = useState<Controls | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try {
+      setState((await rpc.call("controls", null)) as Controls);
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to read the controls");
+    }
+  }, [rpc]);
+  useEffect(() => {
+    void load();
+    // The keyboard and the menu bar change these too; keep the page current.
+    const timer = setInterval(() => void load(), 15_000);
+    return () => clearInterval(timer);
+  }, [load]);
+  const act = useCallback(
+    async (call: () => Promise<unknown>) => {
+      try {
+        setState((await call()) as Controls);
+        setError(null);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "The change failed");
+        void load();
+      }
+    },
+    [load],
+  );
+  return { state, error, rpc, act };
+}
+
+/** A 0..100 slider that commits 250 ms after the finger stops, not on every pixel. */
+function LevelSlider(props: { label: string; value: number; onCommit: (value: number) => void }) {
+  const [local, setLocal] = useState(props.value);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!timer.current) setLocal(props.value);
+  }, [props.value]);
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+  return (
+    <label className="flex flex-1 items-center gap-3 text-sm">
+      <span className="w-24 shrink-0 text-muted-foreground">{props.label}</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={local}
+        aria-label={props.label}
+        className="h-8 min-w-0 flex-1 accent-primary"
+        onChange={(event) => {
+          const value = Number(event.currentTarget.value);
+          setLocal(value);
+          if (timer.current) clearTimeout(timer.current);
+          timer.current = setTimeout(() => {
+            timer.current = null;
+            props.onCommit(value);
+          }, 250);
+        }}
+      />
+      <span className="w-10 text-right tabular-nums">{local}%</span>
+    </label>
+  );
+}
+
+function Unavailable({ label, why }: { label: string; why: string | null }) {
+  return (
+    <div className="flex items-center gap-3 text-sm">
+      <span className="w-24 shrink-0 text-muted-foreground">{label}</span>
+      <span className="text-xs text-muted-foreground">Unavailable{why ? `: ${why}` : ""}</span>
+    </div>
+  );
+}
+
+function ControlsCard() {
+  const { state, error, rpc, act } = useControls();
+  const [confirming, setConfirming] = useState<PowerAction | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  useRealtime("system.control-error", (event) => {
+    const payload = event as { action?: string; message?: string } | null;
+    setNotice(`${payload?.action ?? "The power action"} failed: ${payload?.message ?? "no reason given"}`);
+  });
+  const runPower = async (action: PowerAction) => {
+    setConfirming(null);
+    const label = POWER.find((p) => p.action === action)?.label ?? action;
+    try {
+      const result = await rpc.call("power", { action });
+      setNotice(`${label} in ${(result.inMs / 1000).toFixed(1)} s.`);
+    } catch (cause) {
+      setNotice(`${label} failed: ${cause instanceof Error ? cause.message : "no reason given"}`);
+    }
+  };
+  const pending = POWER.find((p) => p.action === confirming);
+  return (
+    <div className="rounded-lg border border-border bg-card p-4 space-y-3">
+      <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Controls</div>
+      {error ? <div role="alert" className="text-sm text-destructive">{error}</div> : null}
+      {!state ? (
+        <div className="text-sm text-muted-foreground">Reading the controls…</div>
+      ) : (
+        <>
+          {state.volume ? (
+            <div className="flex items-center gap-2">
+              <LevelSlider
+                label="Volume"
+                value={state.volume.level}
+                onCommit={(level) => void act(() => rpc.call("setVolume", { level }))}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-pressed={state.volume.muted}
+                onClick={() => void act(() => rpc.call("setMuted", { muted: !state.volume!.muted }))}
+              >
+                {state.volume.muted ? "Unmute" : "Mute"}
+              </Button>
+            </div>
+          ) : (
+            <Unavailable label="Volume" why={state.volumeError} />
+          )}
+          {state.brightness !== null ? (
+            <LevelSlider
+              label="Brightness"
+              value={Math.round(state.brightness * 100)}
+              onCommit={(value) => void act(() => rpc.call("setBrightness", { level: value / 100 }))}
+            />
+          ) : (
+            <Unavailable label="Brightness" why={state.brightnessError} />
+          )}
+          {state.amphetamine.installed ? (
+            <div className="flex items-center gap-3 text-sm">
+              <span className="w-24 shrink-0 text-muted-foreground">Amphetamine</span>
+              {state.amphetamine.active === null ? (
+                <span className="text-xs text-destructive">{state.amphetamine.error ?? "state unknown"}</span>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  aria-pressed={state.amphetamine.active}
+                  onClick={() => void act(() => rpc.call("setAmphetamine", { active: !state.amphetamine.active }))}
+                >
+                  Keep awake: {state.amphetamine.active ? "On" : "Off"}
+                </Button>
+              )}
+            </div>
+          ) : null}
+        </>
+      )}
+      <div className="flex flex-wrap gap-2 pt-1">
+        {POWER.map((p) => (
+          <Button
+            key={p.action}
+            type="button"
+            size="sm"
+            variant={p.danger ? "destructive" : "outline"}
+            onClick={() => {
+              setNotice(null);
+              setConfirming(p.action);
+            }}
+          >
+            {p.label}
+          </Button>
+        ))}
+      </div>
+      {pending ? (
+        <div role="alertdialog" aria-label={pending.question} className="rounded-lg border border-border bg-muted/60 p-3 space-y-2 text-sm">
+          <div className="font-medium text-foreground">{pending.question}</div>
+          <div className="text-muted-foreground">{pending.detail}</div>
+          <div className="flex gap-2">
+            <Button type="button" size="sm" variant={pending.danger ? "destructive" : "default"} onClick={() => void runPower(pending.action)}>
+              {pending.label}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setConfirming(null)}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {notice ? <div className="text-sm text-muted-foreground">{notice}</div> : null}
+    </div>
+  );
+}
+
 function SystemPanel() {
   const { machines, primaryHostId, error: machineError } = useMachines();
   const [selectedHostId, setSelectedHostId] = useSelectedMachine(machines, primaryHostId);
@@ -450,6 +658,7 @@ function SystemPanel() {
             <MachineSelect machines={machines} value={selectedHostId} onChange={setSelectedHostId} />
           ) : null}
         </div>
+        {primaryHostId && selectedHostId === primaryHostId ? <ControlsCard /> : null}
         {error ? (
           <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
             Could not load this machine: {error}

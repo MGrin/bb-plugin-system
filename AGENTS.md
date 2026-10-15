@@ -11,7 +11,7 @@ against a wrong one that looked right.
 
 ```sh
 npm install          # rc=0
-npm test             # node --test over lib/*.test.ts — 12 tests, 0 fail
+npm test             # node --test over lib/*.test.ts — 26 tests, 0 fail (2026-10-15)
 npm run typecheck    # tsc --noEmit, rc=0
 bb plugin build .    # dist/{server,app}.js + .meta.json + app.css
 ```
@@ -32,7 +32,7 @@ must not move.
 | path | what it is |
 |---|---|
 | `server.ts` | sampler, ring buffer, `bb system` commands, remote-machine sampling |
-| `lib/` | the pieces with their own tests (`battery.ts`), plus UI helpers |
+| `lib/` | the pieces with their own tests (`battery.ts`, `controls.ts`), the brightness helper's Swift source, plus UI helpers |
 | `app.tsx`, `components/`, `hooks/` | the panel and the homepage tiles |
 | `components.json` | shadcn config — `components/ui/**` is generated, do not hand-edit |
 
