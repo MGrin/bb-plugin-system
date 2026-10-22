@@ -39,6 +39,7 @@ import {
   AMPHETAMINE_APP,
   amphetamineShape,
   controlsStateShape,
+  controlsSupported,
   levelsShape,
   powerActionShape,
   readAmphetamine,
@@ -108,7 +109,8 @@ const machineInput = z.object({ hostId: z.string().min(1).optional() }).strict()
 export const rpcContract = defineRpcContract({
   machines: {
     input: z.null(),
-    output: z.object({ machines: z.array(machineShape), primaryHostId: z.string() }),
+    // controlsSupported: whether THIS machine (bb's server) has the macOS controls at all.
+    output: z.object({ machines: z.array(machineShape), primaryHostId: z.string(), controlsSupported: z.boolean() }),
   },
   current: {
     input: machineInput,
@@ -391,6 +393,13 @@ function ensureBrightnessHelper(log: BbPluginApi["log"]): Promise<string | null>
     }
   })();
   return brightnessHelper;
+}
+
+const CONTROLS_SUPPORTED = controlsSupported(process.platform);
+
+/** The panel hides the card off macOS; this stops a stale page or a direct RPC acting anyway. */
+function requireControls(): void {
+  if (!CONTROLS_SUPPORTED) throw new Error(`machine controls are macOS-only; this machine is ${process.platform}`);
 }
 
 export default async function plugin(bb: BbPluginApi) {
@@ -819,7 +828,7 @@ export default async function plugin(bb: BbPluginApi) {
           Number(b.status === "connected") - Number(a.status === "connected") ||
           a.name.localeCompare(b.name),
       );
-      return { machines, primaryHostId };
+      return { machines, primaryHostId, controlsSupported: CONTROLS_SUPPORTED };
     },
     async current(input) {
       const hostId = input?.hostId ?? primaryHostId;
@@ -901,6 +910,7 @@ export default async function plugin(bb: BbPluginApi) {
     // taps move three steps instead of three reads of the same starting level.
     nudge: ({ target, direction }) =>
       serially(async () => {
+        requireControls();
         const helper = await ensureBrightnessHelper(bb.log);
         const now = await readLevels(execOut, helper);
         if (target === "volume") {
@@ -914,14 +924,17 @@ export default async function plugin(bb: BbPluginApi) {
       }),
     setMuted: ({ muted }) =>
       serially(async () => {
+        requireControls();
         await setMuted(execOut, muted);
         return readLevels(execOut, await ensureBrightnessHelper(bb.log));
       }),
     async setAmphetamine({ active }) {
+      requireControls();
       await setAmphetamine(execOut, active);
       return readAmphetamine(execOut, existsSync(AMPHETAMINE_APP));
     },
     power({ action }) {
+      requireControls();
       // Logged before it runs: after a shutdown this line is the only record of who asked.
       bb.log.info(`power: ${action} requested from the System page`);
       const inMs = schedulePower(action, execOut, POWER_DELAY_MS, (message) => {

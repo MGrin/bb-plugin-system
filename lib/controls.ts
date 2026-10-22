@@ -20,6 +20,15 @@ export const AMPHETAMINE_APP = "/Applications/Amphetamine.app";
 const READ_TIMEOUT_MS = 8_000;
 const WRITE_TIMEOUT_MS = 15_000;
 
+/**
+ * Every control here drives macOS (osascript, pmset, the Swift brightness helper,
+ * Amphetamine), so on any other platform there is nothing to control: the panel hides
+ * the card and the server refuses the calls that act.
+ */
+export function controlsSupported(platform: string): boolean {
+  return platform === "darwin";
+}
+
 export const powerActionShape = z.enum(["sleep", "lock", "restart", "shutdown"]);
 export type PowerAction = z.infer<typeof powerActionShape>;
 
