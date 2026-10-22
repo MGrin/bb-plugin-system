@@ -11,6 +11,7 @@ import {
   automationHint,
   brightnessFrac,
   clampVolume,
+  controlsSupported,
   describeError,
   parseAmphetamine,
   parseBrightness,
@@ -221,4 +222,10 @@ test("readLevels reads volume and brightness only, never Amphetamine", async () 
   assert.deepEqual(levels, { volume: { level: 75, muted: false }, volumeError: null, brightness: 0.5, brightnessError: null });
   assert.ok(!asked.some((a) => a.includes("Amphetamine")), asked.join(" | "));
   assertJsonValue(levels);
+});
+
+test("controlsSupported: macOS only; Linux and Windows get the stats and no controls", () => {
+  assert.equal(controlsSupported("darwin"), true);
+  assert.equal(controlsSupported("linux"), false);
+  assert.equal(controlsSupported("win32"), false);
 });

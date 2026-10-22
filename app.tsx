@@ -166,6 +166,7 @@ function useMachines() {
   const connectionState = useRealtimeConnectionState();
   const [machines, setMachines] = useState<Machine[]>([]);
   const [primaryHostId, setPrimaryHostId] = useState<string | null>(null);
+  const [controlsSupported, setControlsSupported] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestId = useRef(0);
   const hasConnected = useRef(false);
@@ -176,6 +177,7 @@ function useMachines() {
       if (id !== requestId.current) return;
       setMachines(result.machines as Machine[]);
       setPrimaryHostId(result.primaryHostId);
+      setControlsSupported(result.controlsSupported);
       setError(null);
     } catch (cause) {
       if (id !== requestId.current) return;
@@ -197,7 +199,7 @@ function useMachines() {
     return () => clearTimeout(timer);
   }, [connectionState, error, load]);
   useRealtime("system.machines", () => { void load(); });
-  return { machines, primaryHostId, error };
+  return { machines, primaryHostId, controlsSupported, error };
 }
 
 function MachineSelect(props: {
@@ -690,7 +692,7 @@ function ControlsCard() {
 }
 
 function SystemPanel() {
-  const { machines, primaryHostId, error: machineError } = useMachines();
+  const { machines, primaryHostId, controlsSupported, error: machineError } = useMachines();
   const [selectedHostId, setSelectedHostId] = useSelectedMachine(machines, primaryHostId);
   const { cur, hist, error } = useSystem(selectedHostId, 60, true);
   const s = cur?.sample;
@@ -704,7 +706,7 @@ function SystemPanel() {
             <MachineSelect machines={machines} value={selectedHostId} onChange={setSelectedHostId} />
           ) : null}
         </div>
-        {primaryHostId && selectedHostId === primaryHostId ? <ControlsCard /> : null}
+        {controlsSupported && primaryHostId && selectedHostId === primaryHostId ? <ControlsCard /> : null}
         {error ? (
           <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
             Could not load this machine: {error}

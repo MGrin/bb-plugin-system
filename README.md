@@ -32,8 +32,9 @@ while that fleet was running?" — which is the question that actually comes up.
 
 ## Machine controls (macOS)
 
-When the primary machine is selected, the System panel shows a **Controls** card, made
-to be used from the bb web app on a phone:
+When the primary machine is selected and it runs macOS, the System panel shows a
+**Controls** card, made to be used from the bb web app on a phone. On Linux or Windows the
+panel shows the stats only: the card is hidden and the server refuses the calls that act.
 
 - **Brightness and volume keys**, styled like a MacBook's top row: brightness down/up,
   mute, volume down/up. Each press moves one sixteenth, as the Mac's own keys do, and
